@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
+  ArrowLeft,
   ShieldCheck,
   Trophy,
   Flame,
@@ -10,6 +11,7 @@ import {
   Radio,
   FileText,
   AlertCircle,
+  AlertTriangle,
   Clock,
   Sparkles,
   Award,
@@ -20,10 +22,41 @@ import {
   KeyRound,
   Maximize2,
   Minimize2,
-  Crown
+  Crown,
+  Users,
+  Shuffle,
+  Layers,
+  UserPlus,
+  HelpCircle,
+  Database,
+  X
 } from 'lucide-react';
-import { PADEL_TOURNAMENTS_DATA } from '../data/padelProTournamentsData';
+import {
+  getStoredTournaments,
+  getStoredTournamentById,
+  saveTournament,
+  syncLiveMatchScore,
+  finishAndPublishMatch
+} from '../data/tournamentStorage';
+import {
+  getStoredRefereeState,
+  saveStoredRefereeState,
+  clearStoredRefereeState,
+  restoreStoredRefereeState,
+  RefereeScoringState
+} from '../data/refereeStorage';
+import {
+  getStoredBracket,
+  syncLiveScoreToBracket,
+  findAndAdvanceMatchInBracket
+} from '../data/bracketStorage';
+import { getStoredTournamentGroups } from '../data/tournamentGroupStorage';
 import { SuperAdminBracketManager } from './SuperAdminBracketManager';
+import { AdminMemberManager } from './AdminMemberManager';
+import { AdminGroupDrawManager } from './AdminGroupDrawManager';
+import { AdminMemberPoolAllocation } from './AdminMemberPoolAllocation';
+import { AdminTournamentManager } from './AdminTournamentManager';
+import { apiLogin } from '../data/apiClient';
 
 interface RefereeAdminPortalProps {
   onBackToGuest: () => void;
@@ -73,29 +106,435 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
     username: string;
     name: string;
     role: string;
+    account_type?: string;
   } | null>(null);
 
-  // Portal Tab: Super Admin Bracket Manager vs Wasit Digital Scorekeeper
-  const [activePortalTab, setActivePortalTab] = useState<'bracket' | 'referee'>('bracket');
+  const isAdminUser = loggedInUser?.account_type === 'admin' || loggedInUser?.username === 'admin';
+
+  // Portal Tabs: Kelola Turnamen (Admin), Member Klub (Admin), Alokasi Pool (Admin), Undian Grup & Acak (Admin), Super Admin Bracket, Wasit Skoring
+  const [activePortalTab, setActivePortalTab] = useState<'tournament-manager' | 'member' | 'pool-allocation' | 'group-draw' | 'bracket' | 'referee'>('tournament-manager');
 
   // Tournament and match selection
-  const [selectedTourneyId, setSelectedTourneyId] = useState<string>('rookie-mix');
+  const [tournaments, setTournaments] = useState(() => getStoredTournaments());
+  const liveTournaments = tournaments.filter((t) => t.status === 'Live');
+
+  const [selectedTourneyId, setSelectedTourneyId] = useState<string>(() => {
+    const stored = getStoredTournaments();
+    const live = stored.find((t) => t.status === 'Live');
+    if (live) return live.id;
+    return stored.length > 0 ? stored[0].id : 'rookie-mix';
+  });
   const [activeCourt, setActiveCourt] = useState<number>(2);
   const [matchPhase, setMatchPhase] = useState<string>('Grand Final');
 
-  // Referee Scoring Sheet State
-  const [teamAName, setTeamAName] = useState<string>('Olivia & Rico');
-  const [teamBName, setTeamBName] = useState<string>('Kartika & Dodie');
-  const [courtScoreA, setCourtScoreA] = useState<number>(2); // 0=0, 1=15, 2=30, 3=40
-  const [courtScoreB, setCourtScoreB] = useState<number>(1);
-  const [gamesTeamA, setGamesTeamA] = useState<number>(3);
-  const [gamesTeamB, setGamesTeamB] = useState<number>(2);
-  const [currentSetA, setCurrentSetA] = useState<number>(1);
-  const [currentSetB, setCurrentSetB] = useState<number>(0);
-  const [currentServer, setCurrentServer] = useState<'A' | 'B'>('A');
-  const [goldenPointActive, setGoldenPointActive] = useState<boolean>(false);
-  const [officialRefereeNotes, setOfficialRefereeNotes] = useState<string>('Pertandingan berjalan kondusif sesuai regulasi FIP Padel Pro.');
+  // Referee Scoring Sheet State (Persistent & Synchronized)
+  const initialReferee = getStoredRefereeState();
+  const [teamAName, setTeamAName] = useState<string>(initialReferee.teamAName);
+  const [teamBName, setTeamBName] = useState<string>(initialReferee.teamBName);
+  const [courtScoreA, setCourtScoreA] = useState<number>(initialReferee.courtScoreA); // 0=0, 1=15, 2=30, 3=40
+  const [courtScoreB, setCourtScoreB] = useState<number>(initialReferee.courtScoreB);
+  const [gamesTeamA, setGamesTeamA] = useState<number>(initialReferee.gamesTeamA);
+  const [gamesTeamB, setGamesTeamB] = useState<number>(initialReferee.gamesTeamB);
+  const [currentSetA, setCurrentSetA] = useState<number>(initialReferee.currentSetA);
+  const [currentSetB, setCurrentSetB] = useState<number>(initialReferee.currentSetB);
+  const [currentServer, setCurrentServer] = useState<'A' | 'B'>(initialReferee.currentServer || 'A');
+  const [goldenPointActive, setGoldenPointActive] = useState<boolean>(initialReferee.goldenPointActive || false);
+  const [officialRefereeNotes, setOfficialRefereeNotes] = useState<string>(initialReferee.officialRefereeNotes || '');
   const [publishSuccessMessage, setPublishSuccessMessage] = useState<string | null>(null);
+  const [scoreHistory, setScoreHistory] = useState<string[]>(initialReferee.scoreHistory || []);
+
+  // Listen to tournament updates and scoring reset
+  useEffect(() => {
+    const handleTournamentsUpdate = () => {
+      const updated = getStoredTournaments();
+      setTournaments(updated);
+      if (activePortalTab === 'referee') {
+        const liveList = updated.filter((t) => t.status === 'Live');
+        if (liveList.length > 0 && !liveList.some((t) => t.id === selectedTourneyId)) {
+          setSelectedTourneyId(liveList[0].id);
+        } else if (liveList.length === 0) {
+          setSelectedTourneyId('');
+        }
+      } else if (!updated.some((t) => t.id === selectedTourneyId)) {
+        setSelectedTourneyId(updated.length > 0 ? updated[0].id : '');
+      }
+    };
+
+    const handleScoringReset = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail?.cleared) {
+        setTeamAName('Tim A (TBD)');
+        setTeamBName('Tim B (TBD)');
+        setCourtScoreA(0);
+        setCourtScoreB(0);
+        setGamesTeamA(0);
+        setGamesTeamB(0);
+        setCurrentSetA(0);
+        setCurrentSetB(0);
+        setCurrentServer('A');
+        setGoldenPointActive(false);
+        setScoreHistory([]);
+        setHistoryStack([]);
+        setOfficialRefereeNotes('Pertandingan belum dimulai (Data skoring & hasil wasit dikosongkan).');
+      } else if (customEvent.detail?.resetToDefault) {
+        setTeamAName('Olivia & Rico');
+        setTeamBName('Kartika & Dodie');
+        setCourtScoreA(2);
+        setCourtScoreB(1);
+        setGamesTeamA(3);
+        setGamesTeamB(2);
+        setCurrentSetA(1);
+        setCurrentSetB(0);
+        setCurrentServer('A');
+        setGoldenPointActive(false);
+        setScoreHistory([
+          'Game 1 dimenangkan Tim A (40-15)',
+          'Game 2 dimenangkan Tim B (Golden Point 40-40)',
+          'Game 3 dimenangkan Tim A (40-30)'
+        ]);
+        setHistoryStack([]);
+        setOfficialRefereeNotes('Pertandingan berjalan kondusif sesuai regulasi FIP Padel Pro.');
+      }
+    };
+
+    window.addEventListener('lagilagipadel_tournaments_updated', handleTournamentsUpdate);
+    window.addEventListener('lagilagipadel_scoring_reset', handleScoringReset);
+    return () => {
+      window.removeEventListener('lagilagipadel_tournaments_updated', handleTournamentsUpdate);
+      window.removeEventListener('lagilagipadel_scoring_reset', handleScoringReset);
+    };
+  }, [selectedTourneyId, activePortalTab]);
+
+  // Pada laman Skoring Wasit, pastikan turnamen yang terpilih adalah turnamen yang berstatus Live
+  useEffect(() => {
+    if (activePortalTab === 'referee') {
+      const liveList = tournaments.filter((t) => t.status === 'Live');
+      if (liveList.length > 0) {
+        if (!liveList.some((t) => t.id === selectedTourneyId)) {
+          setSelectedTourneyId(liveList[0].id);
+        }
+      }
+    }
+  }, [activePortalTab, tournaments, selectedTourneyId]);
+
+  // Reactive groups & bracket for the selected tournament
+  const [liveGroups, setLiveGroups] = useState(() => getStoredTournamentGroups(selectedTourneyId));
+  const [liveBracket, setLiveBracket] = useState(() => getStoredBracket(selectedTourneyId));
+
+  useEffect(() => {
+    setLiveGroups(getStoredTournamentGroups(selectedTourneyId));
+    setLiveBracket(getStoredBracket(selectedTourneyId));
+  }, [selectedTourneyId, tournaments]);
+
+  useEffect(() => {
+    const refreshGroupsAndBracket = () => {
+      setLiveGroups(getStoredTournamentGroups(selectedTourneyId));
+      setLiveBracket(getStoredBracket(selectedTourneyId));
+    };
+    window.addEventListener('lagilagipadel_groups_updated', refreshGroupsAndBracket);
+    window.addEventListener('lagilagipadel_bracket_updated', refreshGroupsAndBracket);
+    window.addEventListener('lagilagipadel_members_updated', refreshGroupsAndBracket);
+    return () => {
+      window.removeEventListener('lagilagipadel_groups_updated', refreshGroupsAndBracket);
+      window.removeEventListener('lagilagipadel_bracket_updated', refreshGroupsAndBracket);
+      window.removeEventListener('lagilagipadel_members_updated', refreshGroupsAndBracket);
+    };
+  }, [selectedTourneyId]);
+
+  // Helper to resolve available team options for the currently selected matchPhase & Pool
+  const phaseTeamSelection = React.useMemo(() => {
+    const tourney = tournaments.find((t) => t.id === selectedTourneyId);
+    const normPhase = matchPhase.toLowerCase();
+    const isPoolMatch = normPhase.includes('pool') || matchPhase.endsWith('Match');
+
+    // Collect pools with teams from liveGroups or fallback to tourney.participants
+    const poolMap = new Map<string, { name: string; p1: string; p2: string; pool: string }[]>();
+    if (liveGroups && liveGroups.length > 0) {
+      liveGroups.forEach((pg) => {
+        poolMap.set(
+          pg.poolName,
+          pg.teams.map((t) => ({
+            name: t.name,
+            p1: t.p1,
+            p2: t.p2,
+            pool: pg.poolName
+          }))
+        );
+      });
+    } else if (tourney?.participants) {
+      tourney.participants.forEach((p) => {
+        const pName = p.pool || 'Pool A';
+        if (!poolMap.has(pName)) poolMap.set(pName, []);
+        poolMap.get(pName)!.push({
+          name: p.teamName,
+          p1: p.p1,
+          p2: p.p2,
+          pool: pName
+        });
+      });
+    }
+
+    if (isPoolMatch) {
+      const targetPoolName = matchPhase.replace(/\s*Match$/i, '').trim();
+      // Find matching pool (case-insensitive)
+      let matchedPoolKey = targetPoolName;
+      for (const key of poolMap.keys()) {
+        if (key.toLowerCase() === targetPoolName.toLowerCase()) {
+          matchedPoolKey = key;
+          break;
+        }
+      }
+      const poolTeams = poolMap.get(matchedPoolKey) || [];
+      return {
+        mode: 'pool' as const,
+        poolName: matchedPoolKey,
+        primaryTeams: poolTeams,
+        bracketPair: null as { team1: string; team2: string } | null,
+        allPools: Array.from(poolMap.entries()).map(([poolName, teams]) => ({ poolName, teams }))
+      };
+    }
+
+    // Knockout / Playoff phase: find corresponding bracket match node
+    let bracketNode: { team1?: { name: string; players?: string }; team2?: { name: string; players?: string } } | null = null;
+    if (
+      normPhase.includes('grand final') ||
+      (normPhase.includes('final') &&
+        !normPhase.includes('semi') &&
+        !normPhase.includes('quarter') &&
+        !normPhase.includes('perempat') &&
+        !normPhase.includes('3'))
+    ) {
+      bracketNode = liveBracket?.grandFinal || null;
+    } else if (normPhase.includes('3') || normPhase.includes('bronze')) {
+      bracketNode = liveBracket?.bronzeMatch || null;
+    } else if (normPhase.includes('semi') && normPhase.includes('1')) {
+      bracketNode = liveBracket?.semis?.[0] || null;
+    } else if (normPhase.includes('semi') && normPhase.includes('2')) {
+      bracketNode = liveBracket?.semis?.[1] || null;
+    } else if (normPhase.includes('perempat') || normPhase.includes('quarter') || normPhase.includes('qf')) {
+      const idx = normPhase.includes('1') ? 0 : normPhase.includes('2') ? 1 : normPhase.includes('3') ? 2 : 3;
+      bracketNode = liveBracket?.quarters?.[idx] || null;
+    } else if (normPhase.includes('16') || normPhase.includes('r16')) {
+      let rIdx = 0;
+      for (let i = 0; i < 8; i++) {
+        if (normPhase.includes(String(i + 1))) {
+          rIdx = i;
+          break;
+        }
+      }
+      bracketNode = liveBracket?.roundOf16?.[rIdx] || null;
+    }
+
+    const bracketPair =
+      bracketNode?.team1?.name && bracketNode?.team2?.name
+        ? { team1: bracketNode.team1.name, team2: bracketNode.team2.name }
+        : null;
+
+    const flatAllTeams: { name: string; p1: string; p2: string; pool: string }[] = [];
+    poolMap.forEach((teams) => flatAllTeams.push(...teams));
+
+    return {
+      mode: 'knockout' as const,
+      poolName: matchPhase,
+      primaryTeams: flatAllTeams,
+      bracketPair,
+      allPools: Array.from(poolMap.entries()).map(([poolName, teams]) => ({ poolName, teams }))
+    };
+  }, [selectedTourneyId, tournaments, matchPhase, liveGroups, liveBracket]);
+
+  // Synchronize teamAName and teamBName whenever tournament, matchPhase, or pool teams change
+  const previousTourneyIdRef = useRef<string>(selectedTourneyId);
+  const previousPhaseRef = useRef<string>(matchPhase);
+  useEffect(() => {
+    const tourneyChanged = previousTourneyIdRef.current !== selectedTourneyId;
+    const phaseChanged = previousPhaseRef.current !== matchPhase;
+    previousTourneyIdRef.current = selectedTourneyId;
+    previousPhaseRef.current = matchPhase;
+
+    if (phaseTeamSelection.mode === 'pool') {
+      const poolTeams = phaseTeamSelection.primaryTeams;
+      if (poolTeams.length >= 2) {
+        const inPoolA = poolTeams.some((t) => t.name === teamAName);
+        const inPoolB = poolTeams.some((t) => t.name === teamBName);
+        if (tourneyChanged || phaseChanged || !inPoolA || !inPoolB || teamAName === teamBName) {
+          const nextA = inPoolA && !tourneyChanged && !phaseChanged ? teamAName : poolTeams[0].name;
+          const nextB =
+            inPoolB && !tourneyChanged && !phaseChanged && teamBName !== nextA
+              ? teamBName
+              : (poolTeams.find((t) => t.name !== nextA)?.name || poolTeams[1].name);
+          setTeamAName(nextA);
+          setTeamBName(nextB);
+        }
+      } else if (poolTeams.length === 1) {
+        setTeamAName(poolTeams[0].name);
+        setTeamBName('Tim Lawan (TBD)');
+      }
+    } else {
+      // Knockout phase
+      const { bracketPair, primaryTeams } = phaseTeamSelection;
+      const validNames = new Set<string>(primaryTeams.map((t) => t.name));
+      if (bracketPair) {
+        validNames.add(bracketPair.team1);
+        validNames.add(bracketPair.team2);
+      }
+
+      if (phaseChanged && bracketPair) {
+        setTeamAName(bracketPair.team1);
+        setTeamBName(bracketPair.team2);
+      } else if (tourneyChanged) {
+        if (bracketPair) {
+          setTeamAName(bracketPair.team1);
+          setTeamBName(bracketPair.team2);
+        } else if (primaryTeams.length >= 2) {
+          setTeamAName(primaryTeams[0].name);
+          setTeamBName(primaryTeams[1].name);
+        }
+      } else {
+        if (!teamAName || teamAName === 'Tim A (TBD)' || (validNames.size > 0 && !validNames.has(teamAName))) {
+          setTeamAName(bracketPair?.team1 || primaryTeams[0]?.name || 'Tim A (TBD)');
+        }
+        if (!teamBName || teamBName === 'Tim B (TBD)' || (validNames.size > 0 && !validNames.has(teamBName))) {
+          setTeamBName(bracketPair?.team2 || primaryTeams[1]?.name || 'Tim B (TBD)');
+        }
+      }
+    }
+  }, [selectedTourneyId, matchPhase, phaseTeamSelection]);
+
+  // Selected tournament object & point display labels
+  const selectedTourneyData = tournaments.find((t) => t.id === selectedTourneyId);
+  const pointLabels = ['0', '15', '30', '40'];
+
+  // Active pools and knockout stage availability for selected tournament
+  const activePools =
+    selectedTourneyData?.groupStandings?.pools?.filter((p) => p !== 'Semua Pool') || [
+      'Pool A',
+      'Pool B',
+      'Pool C',
+      'Pool D'
+    ];
+  const activePoolCount = activePools.length;
+
+  const hasRoundOf16 =
+    !!(selectedTourneyData?.knockoutBracket?.roundOf16 && selectedTourneyData.knockoutBracket.roundOf16.length > 0) ||
+    activePoolCount >= 5;
+
+  const hasQuarters =
+    !!(selectedTourneyData?.knockoutBracket?.quarters && selectedTourneyData.knockoutBracket.quarters.length > 0) ||
+    activePoolCount >= 3;
+
+  const hasSemis =
+    !!(selectedTourneyData?.knockoutBracket?.semis && selectedTourneyData.knockoutBracket.semis.length > 0) ||
+    activePoolCount >= 2;
+
+  // Auto-validate matchPhase when tournament changes or pools are reconfigured
+  useEffect(() => {
+    if (!selectedTourneyData) return;
+    const pools = selectedTourneyData.groupStandings?.pools?.filter((p) => p !== 'Semua Pool') || [
+      'Pool A',
+      'Pool B',
+      'Pool C',
+      'Pool D'
+    ];
+    const poolCount = pools.length;
+    const canR16 =
+      !!(selectedTourneyData.knockoutBracket?.roundOf16 && selectedTourneyData.knockoutBracket.roundOf16.length > 0) ||
+      poolCount >= 5;
+    const canQF =
+      !!(selectedTourneyData.knockoutBracket?.quarters && selectedTourneyData.knockoutBracket.quarters.length > 0) ||
+      poolCount >= 3;
+
+    if (matchPhase.startsWith('Babak 16 Besar') && !canR16) {
+      setMatchPhase(canQF ? 'Perempat Final 1' : 'Semifinal 1');
+    } else if (matchPhase.startsWith('Perempat Final') && !canQF) {
+      setMatchPhase('Semifinal 1');
+    } else if (matchPhase.endsWith('Match')) {
+      const pName = matchPhase.replace(' Match', '').trim();
+      if (!pools.includes(pName)) {
+        setMatchPhase(`${pools[0] || 'Pool A'} Match`);
+      }
+    }
+  }, [selectedTourneyId, selectedTourneyData]);
+
+  // Confirmation Modal state for "Selesai dan Publikasikan Skor ke Sistem Tamu"
+  const [showFinishConfirmModal, setShowFinishConfirmModal] = useState<boolean>(false);
+  const [selectedWinnerChoice, setSelectedWinnerChoice] = useState<'A' | 'B'>('A');
+
+  // Auto-persist referee state changes & AUTO-SYNC real-time score to guest system
+  useEffect(() => {
+    const isCleared =
+      gamesTeamA === 0 &&
+      gamesTeamB === 0 &&
+      courtScoreA === 0 &&
+      courtScoreB === 0 &&
+      scoreHistory.length === 0;
+
+    saveStoredRefereeState({
+      teamAName,
+      teamBName,
+      courtScoreA,
+      courtScoreB,
+      gamesTeamA,
+      gamesTeamB,
+      currentSetA,
+      currentSetB,
+      currentServer,
+      goldenPointActive,
+      scoreHistory,
+      officialRefereeNotes,
+      activeCourt,
+      matchPhase,
+      selectedTourneyId,
+      isCleared
+    });
+
+    // Otomatis sinkronkan dan tampilkan skor ke halaman sistem tamu setiap ada perubahan atau penambahan poin
+    if (selectedTourneyId && !isCleared) {
+      const pA = pointLabels[courtScoreA] || '0';
+      const pB = pointLabels[courtScoreB] || '0';
+      const setDetailStr = `Set ${currentSetA}-${currentSetB} (Games: ${gamesTeamA}-${gamesTeamB}, Poin: ${pA}-${pB}) · Servis: Tim ${currentServer}${
+        goldenPointActive ? ' · ⚡ Golden Point' : ''
+      }`;
+
+      // Sinkronkan ke daftar pertandingan tamu
+      syncLiveMatchScore(
+        selectedTourneyId,
+        activeCourt,
+        matchPhase,
+        teamAName,
+        teamBName,
+        `${gamesTeamA} (${pA})`,
+        `${gamesTeamB} (${pB})`,
+        setDetailStr
+      );
+
+      // Sinkronkan langsung ke bagan sistem gugur (bracket)
+      syncLiveScoreToBracket(
+        selectedTourneyId,
+        matchPhase,
+        teamAName,
+        teamBName,
+        gamesTeamA,
+        gamesTeamB,
+        `Court ${activeCourt}`
+      );
+    }
+  }, [
+    teamAName,
+    teamBName,
+    courtScoreA,
+    courtScoreB,
+    gamesTeamA,
+    gamesTeamB,
+    currentSetA,
+    currentSetB,
+    currentServer,
+    goldenPointActive,
+    scoreHistory,
+    officialRefereeNotes,
+    activeCourt,
+    matchPhase,
+    selectedTourneyId
+  ]);
 
   // Scoreboard Full Screen State & Ref
   const [isScoreboardFullscreen, setIsScoreboardFullscreen] = useState<boolean>(false);
@@ -154,17 +593,6 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
     golden: boolean;
   }[]>([]);
 
-  // Match live log
-  const [scoreHistory, setScoreHistory] = useState<string[]>([
-    'Game 1 dimenangkan Tim A (40-15)',
-    'Game 2 dimenangkan Tim B (Golden Point 40-40)',
-    'Game 3 dimenangkan Tim A (40-30)',
-    'Game 4 dimenangkan Tim B (40-0)',
-    'Game 5 dimenangkan Tim A (40-30)'
-  ]);
-
-  const pointLabels = ['0', '15', '30', '40'];
-
   const pushHistorySnapshot = () => {
     setHistoryStack((prev) => [
       {
@@ -179,6 +607,88 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
       },
       ...prev.slice(0, 10)
     ]);
+  };
+
+  // Helper: Muat pasangan tim dari bagan sesuai babak terpilih
+  const handleLoadTeamsFromBracket = () => {
+    if (!selectedTourneyId) return;
+    const bracket = getStoredBracket(selectedTourneyId);
+    if (!bracket) return;
+
+    const norm = matchPhase.toLowerCase();
+    let loaded = false;
+
+    if (norm.includes('pool')) {
+      // Find matching pool from groups
+      const groups = getStoredTournamentGroups(selectedTourneyId);
+      // Try exact pool name match or letter match
+      const matchingGroup = groups.find((g) => {
+        const pNorm = g.poolName.toLowerCase().replace(/[^a-z0-9]/g, '');
+        return norm.includes(pNorm) || (norm.includes('pool') && norm.endsWith(g.poolName.slice(-1).toLowerCase()));
+      });
+
+      if (matchingGroup && matchingGroup.teams && matchingGroup.teams.length >= 2) {
+        setTeamAName(matchingGroup.teams[0].name);
+        setTeamBName(matchingGroup.teams[1].name);
+        loaded = true;
+      } else if (matchingGroup && matchingGroup.teams && matchingGroup.teams.length === 1) {
+        setTeamAName(matchingGroup.teams[0].name);
+        setTeamBName('Tim Lawan (TBD)');
+        loaded = true;
+      }
+    } else if (norm.includes('grand final') || (norm.includes('final') && !norm.includes('semi') && !norm.includes('quarter') && !norm.includes('perempat') && !norm.includes('3'))) {
+      if (bracket.grandFinal && bracket.grandFinal.team1?.name && bracket.grandFinal.team2?.name) {
+        setTeamAName(bracket.grandFinal.team1.name);
+        setTeamBName(bracket.grandFinal.team2.name);
+        loaded = true;
+      }
+    } else if (norm.includes('3') || norm.includes('bronze')) {
+      if (bracket.bronzeMatch && bracket.bronzeMatch.team1?.name && bracket.bronzeMatch.team2?.name) {
+        setTeamAName(bracket.bronzeMatch.team1.name);
+        setTeamBName(bracket.bronzeMatch.team2.name);
+        loaded = true;
+      }
+    } else if (norm.includes('semi') && norm.includes('1')) {
+      if (bracket.semis && bracket.semis[0]) {
+        setTeamAName(bracket.semis[0].team1.name);
+        setTeamBName(bracket.semis[0].team2.name);
+        loaded = true;
+      }
+    } else if (norm.includes('semi') && norm.includes('2')) {
+      if (bracket.semis && bracket.semis[1]) {
+        setTeamAName(bracket.semis[1].team1.name);
+        setTeamBName(bracket.semis[1].team2.name);
+        loaded = true;
+      }
+    } else if (norm.includes('perempat') || norm.includes('quarter') || norm.includes('qf')) {
+      const idx = norm.includes('1') ? 0 : norm.includes('2') ? 1 : norm.includes('3') ? 2 : 3;
+      if (bracket.quarters && bracket.quarters[idx]) {
+        setTeamAName(bracket.quarters[idx].team1.name);
+        setTeamBName(bracket.quarters[idx].team2.name);
+        loaded = true;
+      }
+    } else if (norm.includes('16') || norm.includes('r16')) {
+      let rIdx = 0;
+      for (let i = 0; i < 8; i++) {
+        if (norm.includes(String(i + 1))) {
+          rIdx = i;
+          break;
+        }
+      }
+      if (bracket.roundOf16 && bracket.roundOf16[rIdx]) {
+        setTeamAName(bracket.roundOf16[rIdx].team1.name);
+        setTeamBName(bracket.roundOf16[rIdx].team2.name);
+        loaded = true;
+      }
+    }
+
+    if (loaded) {
+      setPublishSuccessMessage(`Berhasil memuat pasangan tim dari bagan untuk ${matchPhase}!`);
+      setTimeout(() => setPublishSuccessMessage(null), 3500);
+    } else {
+      setPublishSuccessMessage(`Bagan untuk ${matchPhase} belum memiliki data tim atau gunakan input manual.`);
+      setTimeout(() => setPublishSuccessMessage(null), 3500);
+    }
   };
 
   const handlePointForA = () => {
@@ -265,19 +775,93 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
     setScoreHistory((prev) => [`Game di-reset wasit menjadi 0-0`, ...prev]);
   };
 
-  const handlePublishToLive = () => {
-    const summary = `${matchPhase}: ${teamAName} (${gamesTeamA}) vs ${teamBName} (${gamesTeamB}) - Set [${currentSetA}-${currentSetB}]`;
-    if (onPublishScore) {
-      onPublishScore(selectedTourneyId, summary);
+  // Membuka modal konfirmasi penyelesaian pertandingan
+  const handleOpenFinishConfirmModal = () => {
+    // Prediksi pemenang awal dari skor set, game, lalu poin
+    if (currentSetA > currentSetB) {
+      setSelectedWinnerChoice('A');
+    } else if (currentSetB > currentSetA) {
+      setSelectedWinnerChoice('B');
+    } else if (gamesTeamA > gamesTeamB) {
+      setSelectedWinnerChoice('A');
+    } else if (gamesTeamB > gamesTeamA) {
+      setSelectedWinnerChoice('B');
+    } else if (courtScoreA >= courtScoreB) {
+      setSelectedWinnerChoice('A');
+    } else {
+      setSelectedWinnerChoice('B');
     }
-    setPublishSuccessMessage(`Skor resmi Court ${activeCourt} berhasil dipublikasikan ke papan informasi turnamen!`);
-    setTimeout(() => {
-      setPublishSuccessMessage(null);
-    }, 4000);
+    setShowFinishConfirmModal(true);
   };
 
-  // Handle Login Submission
-  const handleLoginSubmit = (e: React.FormEvent) => {
+  // Konfirmasi finalisasi pertandingan (dieksekusi saat wasit memilih "Ya")
+  const handleConfirmFinishAndPublish = () => {
+    setShowFinishConfirmModal(false);
+
+    if (!selectedTourneyId) {
+      setPublishSuccessMessage('Peringatan: Harap pilih turnamen aktif terlebih dahulu.');
+      return;
+    }
+
+    const winnerName = selectedWinnerChoice === 'A' ? teamAName : teamBName;
+    const loserName = selectedWinnerChoice === 'A' ? teamBName : teamAName;
+    const finalScoreA = String(gamesTeamA);
+    const finalScoreB = String(gamesTeamB);
+    const setSummary = `Set ${currentSetA}-${currentSetB} (${gamesTeamA}-${gamesTeamB})`;
+
+    // 1. Selesaikan dan publikasikan pertandingan resmi ke turnamen tamu
+    const { isGrandFinal } = finishAndPublishMatch(
+      selectedTourneyId,
+      activeCourt,
+      matchPhase,
+      teamAName,
+      teamBName,
+      finalScoreA,
+      finalScoreB,
+      setSummary,
+      selectedWinnerChoice
+    );
+
+    // 2. Otomatis loloskan tim pemenang ke babak berikutnya di bagan sistem gugur (bracket)
+    const bracketAdvancement = findAndAdvanceMatchInBracket(
+      selectedTourneyId,
+      matchPhase,
+      teamAName,
+      teamBName,
+      finalScoreA,
+      finalScoreB,
+      selectedWinnerChoice
+    );
+
+    if (onPublishScore) {
+      onPublishScore(
+        selectedTourneyId,
+        `Pertandingan Selesai: ${winnerName} menang atas ${loserName} (${setSummary})`
+      );
+    }
+
+    // 3. Catat di riwayat lembar wasit
+    setScoreHistory((prev) => [
+      `[SELESAI & DIPUBLIKASIKAN] ${matchPhase}: ${winnerName} menang atas ${loserName} (${finalScoreA}-${finalScoreB}). Lolos: ${bracketAdvancement.advancedTo || 'Babak Selanjutnya'}.`,
+      ...prev
+    ]);
+
+    // 4. Tampilkan pesan feedback sukses
+    let msg = `Pertandingan ${matchPhase} resmi SELESAI! Skor telah dipublikasikan ke sistem tamu. Tim "${winnerName}" otomatis lolos ke babak berikutnya di bracket (${bracketAdvancement.advancedTo || 'Babak Selanjutnya'})!`;
+    if (isGrandFinal) {
+      msg = `🎉 GRAND FINAL SELESAI! Selamat kepada "${winnerName}" sebagai JUARA 1 (Gold Champion)! Podium juara turnamen & Hall of Fame telah resmi diperbarui!`;
+    }
+    setPublishSuccessMessage(msg);
+    setTimeout(() => {
+      setPublishSuccessMessage(null);
+    }, 7000);
+  };
+
+  // State for login loading indicator
+  const [isLoggingIn, setIsLoggingIn] = useState<boolean>(false);
+
+  // Handle Login Submission via MySQL / SHA-256 API
+  const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
 
@@ -294,34 +878,35 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
       return;
     }
 
-    const account = AUTHORIZED_ACCOUNTS[cleanUser];
-    if (!account) {
-      setAuthError(`Username "${cleanUser}" tidak terdaftar atau tidak memiliki akses wasit/admin.`);
-      return;
-    }
+    setIsLoggingIn(true);
+    try {
+      const res = await apiLogin(cleanUser, cleanPass);
+      if (!res.success || !res.user) {
+        setAuthError(res.error || 'Username atau kata sandi / PIN tidak sesuai.');
+        return;
+      }
 
-    if (!account.password.includes(cleanPass)) {
-      setAuthError(`Kata sandi / PIN salah untuk akun "${cleanUser}".`);
-      return;
-    }
+      // Login successful
+      setIsAuthenticated(true);
+      const accType = res.user.account_type || (res.user.username === 'admin' ? 'admin' : 'wasit');
+      setLoggedInUser({
+        username: res.user.username,
+        name: res.user.name,
+        role: res.user.role || (accType === 'admin' ? 'Super Admin / Panitia Pusat' : 'Wasit Pertandingan'),
+        account_type: accType
+      });
 
-    // Login successful
-    setIsAuthenticated(true);
-    setLoggedInUser({
-      username: cleanUser,
-      name: account.name,
-      role: account.role
-    });
-    if (cleanUser === 'admin') {
-      setActivePortalTab('bracket');
+      if (res.user.account_type === 'admin') {
+        setActivePortalTab('tournament-manager');
+      } else {
+        setActivePortalTab('referee');
+      }
+      setAuthError('');
+    } catch (err: any) {
+      setAuthError('Terjadi kesalahan saat memverifikasi akun.');
+    } finally {
+      setIsLoggingIn(false);
     }
-    setAuthError('');
-  };
-
-  const handleQuickLogin = (quickUser: string, quickPass: string) => {
-    setUsername(quickUser);
-    setPassword(quickPass);
-    setAuthError('');
   };
 
   const handleLogout = () => {
@@ -429,47 +1014,13 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
             {/* Submit Button */}
             <button
               type="submit"
-              className="w-full py-3 rounded-xl bg-[#006A6A] hover:bg-[#007A7C] text-white font-bold text-xs uppercase tracking-wider transition-all shadow-md shadow-[#006A6A]/20 cursor-pointer flex items-center justify-center gap-2 mt-2"
+              disabled={isLoggingIn}
+              className="w-full py-3 rounded-xl bg-[#006A6A] hover:bg-[#007A7C] text-white font-bold text-xs uppercase tracking-wider transition-all shadow-md shadow-[#006A6A]/20 cursor-pointer flex items-center justify-center gap-2 mt-2 disabled:opacity-60"
             >
               <KeyRound className="w-4 h-4" />
-              <span>Masuk ke Lembar Skoring Wasit</span>
+              <span>{isLoggingIn ? 'Memverifikasi Akun...' : 'Masuk ke Portal'}</span>
             </button>
           </form>
-
-          {/* Akun Demo / Bantuan Pengujian Cepat */}
-          <div className="p-3.5 rounded-2xl bg-[#EEF4F3] border border-[#D8DFDE] space-y-2">
-            <span className="text-[10px] font-mono uppercase text-[#006A6A] font-bold block tracking-wider">
-              Pilihan Akun Resmi untuk Pengujian Cepat:
-            </span>
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <button
-                type="button"
-                onClick={() => handleQuickLogin('wasit', '1234')}
-                className="p-2 rounded-lg bg-white hover:bg-emerald-50 border border-[#D8DFDE] hover:border-emerald-300 text-left transition-all cursor-pointer group"
-              >
-                <div className="font-bold text-[#191C1C] group-hover:text-emerald-700 flex items-center justify-between">
-                  <span>wasit</span>
-                  <span className="text-[9px] font-mono px-1 rounded bg-neutral-100">PIN: 1234</span>
-                </div>
-                <div className="text-[10px] text-[#6F7978]">Wasit Utama FIP</div>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => handleQuickLogin('admin', 'admin123')}
-                className="p-2 rounded-lg bg-white hover:bg-emerald-50 border border-[#D8DFDE] hover:border-emerald-300 text-left transition-all cursor-pointer group"
-              >
-                <div className="font-bold text-[#191C1C] group-hover:text-emerald-700 flex items-center justify-between">
-                  <span>admin</span>
-                  <span className="text-[9px] font-mono px-1 rounded bg-neutral-100">admin123</span>
-                </div>
-                <div className="text-[10px] text-[#6F7978]">Super Admin Turnamen</div>
-              </button>
-            </div>
-            <p className="text-[10px] text-[#6F7978] leading-tight pt-1">
-              Klik salah satu akun di atas untuk mengisi formulir otomatis, lalu tekan tombol Masuk.
-            </p>
-          </div>
 
           {/* Tombol Batalkan / Kembali ke Tamu */}
           <div className="pt-2 border-t border-[#D8DFDE] text-center">
@@ -477,15 +1028,14 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
               onClick={onBackToGuest}
               className="text-xs font-semibold text-[#6F7978] hover:text-[#006A6A] transition-colors cursor-pointer inline-flex items-center gap-1.5"
             >
-              <span>← Kembali ke Halaman Utama (Tamu)</span>
+              <ArrowLeft className="w-4 h-4" />
+              <span>Kembali ke Halaman Utama (Tamu)</span>
             </button>
           </div>
         </div>
       </div>
     );
   }
-
-  const selectedTourneyData = PADEL_TOURNAMENTS_DATA[selectedTourneyId] || PADEL_TOURNAMENTS_DATA['rookie-mix'];
 
   return (
     <div className="min-h-screen bg-[#F6FAF9] text-[#191C1C] pb-24">
@@ -501,12 +1051,9 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
                 <span className="text-xs font-black uppercase tracking-wider text-white">
                   Portal Khusus Wasit & Admin
                 </span>
-                <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                  OFFICIAL ACCESS
-                </span>
               </div>
               <p className="text-[10px] text-neutral-400 font-mono hidden sm:block">
-                Lembar Skoring Elektronik Resmi · Terverifikasi
+                Manajemen Turnamen, Member, dan Lembar Skoring
               </p>
             </div>
           </div>
@@ -525,83 +1072,350 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
               title="Keluar dari sesi wasit"
             >
               <LogOut className="w-3.5 h-3.5 text-amber-400" />
-              <span>Keluar / Logout</span>
-            </button>
-
-            <button
-              onClick={onBackToGuest}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#006A6A] hover:bg-[#007A7C] text-white text-xs font-semibold transition-all cursor-pointer shadow-xs"
-            >
-              <span>Halaman Tamu</span>
+              <span>Logout</span>
             </button>
           </div>
         </div>
       </div>
 
       <div className="max-w-5xl mx-auto px-4 sm:px-6 pt-6 space-y-6">
-        {/* Dual Portal Tabs: Super Admin Bracket & Wasit Skoring */}
-        <div className="flex items-center gap-2 p-1.5 rounded-2xl bg-white border border-[#D8DFDE] shadow-xs">
-          <button
-            type="button"
-            onClick={() => setActivePortalTab('bracket')}
-            className={`flex-1 py-3 px-4 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer ${
-              activePortalTab === 'bracket'
-                ? 'bg-[#006A6A] text-white shadow-sm'
-                : 'text-[#3D5A57] hover:text-[#006A6A] hover:bg-[#F6FAF9]'
-            }`}
-          >
-            <Crown className="w-4 h-4 text-amber-300" />
-            <span>Kelola Bracket Knock Out (Super Admin)</span>
-            <span className="px-2 py-0.5 rounded text-[9px] font-mono bg-amber-400 text-amber-950 font-black">
-              BAGAN SISTEM GUGUR
-            </span>
-          </button>
+        {/* Navigation Tabs: Kelola Turnamen, Member Klub, Alokasi Pool, Undian Grup, Bracket Knock Out, Lembar Wasit */}
+        <div className="p-1.5 rounded-2xl bg-white border border-[#D8DFDE] shadow-xs">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-1.5">
+            {/* Tab 0: Kelola Turnamen (Admin) */}
+            <button
+              type="button"
+              onClick={() => setActivePortalTab('tournament-manager')}
+              className={`py-3 px-2 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                activePortalTab === 'tournament-manager'
+                  ? 'bg-[#006A6A] text-white shadow-sm'
+                  : 'text-[#3D5A57] hover:text-[#006A6A] hover:bg-[#F6FAF9]'
+              }`}
+            >
+              <Trophy className="w-4 h-4 text-emerald-300" />
+              <span>Kelola Turnamen</span>
+              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-emerald-400 text-emerald-950 font-black">
+                ADMIN
+              </span>
+            </button>
 
-          <button
-            type="button"
-            onClick={() => setActivePortalTab('referee')}
-            className={`flex-1 py-3 px-4 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer ${
-              activePortalTab === 'referee'
-                ? 'bg-[#006A6A] text-white shadow-sm'
-                : 'text-[#3D5A57] hover:text-[#006A6A] hover:bg-[#F6FAF9]'
-            }`}
-          >
-            <Radio className="w-4 h-4 text-red-400 animate-pulse" />
-            <span>Lembar Skoring Wasit Digital (Live Match)</span>
-          </button>
+            {/* Tab 1: Member Klub & Foto (Admin) */}
+            <button
+              type="button"
+              onClick={() => setActivePortalTab('member')}
+              className={`py-3 px-2 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                activePortalTab === 'member'
+                  ? 'bg-[#006A6A] text-white shadow-sm'
+                  : 'text-[#3D5A57] hover:text-[#006A6A] hover:bg-[#F6FAF9]'
+              }`}
+            >
+              <Users className="w-4 h-4 text-emerald-300" />
+              <span>Member</span>
+              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-emerald-400 text-emerald-950 font-black">
+                ADMIN
+              </span>
+            </button>
+
+            {/* Tab 2: Alokasi Member ke Pool (BARU!) */}
+            <button
+              type="button"
+              onClick={() => setActivePortalTab('pool-allocation')}
+              className={`py-3 px-2 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                activePortalTab === 'pool-allocation'
+                  ? 'bg-[#006A6A] text-white shadow-sm'
+                  : 'text-[#3D5A57] hover:text-[#006A6A] hover:bg-[#F6FAF9]'
+              }`}
+            >
+              <Layers className="w-4 h-4 text-teal-300" />
+              <span>Alokasi Pool</span>
+              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-teal-300 text-teal-950 font-black">
+                POOL
+              </span>
+            </button>
+
+            {/* Tab 3: Undian & Acak Grup (Admin) */}
+            <button
+              type="button"
+              onClick={() => setActivePortalTab('group-draw')}
+              className={`py-3 px-2 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                activePortalTab === 'group-draw'
+                  ? 'bg-[#006A6A] text-white shadow-sm'
+                  : 'text-[#3D5A57] hover:text-[#006A6A] hover:bg-[#F6FAF9]'
+              }`}
+            >
+              <Shuffle className="w-4 h-4 text-amber-300" />
+              <span>Undian Grup</span>
+              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-amber-400 text-amber-950 font-black">
+                ACAK
+              </span>
+            </button>
+
+            {/* Tab 4: Bracket Knock Out (Super Admin) */}
+            <button
+              type="button"
+              onClick={() => setActivePortalTab('bracket')}
+              className={`py-3 px-2 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                activePortalTab === 'bracket'
+                  ? 'bg-[#006A6A] text-white shadow-sm'
+                  : 'text-[#3D5A57] hover:text-[#006A6A] hover:bg-[#F6FAF9]'
+              }`}
+            >
+              <Crown className="w-4 h-4 text-amber-300" />
+              <span>Bagan Bracket</span>
+              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-amber-400 text-amber-950 font-black">
+                SUPER
+              </span>
+            </button>
+
+            {/* Tab 5: Lembar Skoring Wasit Digital */}
+            <button
+              type="button"
+              onClick={() => setActivePortalTab('referee')}
+              className={`py-3 px-2 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                activePortalTab === 'referee'
+                  ? 'bg-[#006A6A] text-white shadow-sm'
+                  : 'text-[#3D5A57] hover:text-[#006A6A] hover:bg-[#F6FAF9]'
+              }`}
+            >
+              <Radio className="w-4 h-4 text-red-400 animate-pulse" />
+              <span>Skoring Wasit</span>
+              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-red-100 text-red-700 font-black">
+                LIVE
+              </span>
+            </button>
+          </div>
         </div>
 
-        {/* TAB 1: SUPER ADMIN BRACKET MANAGER */}
-        {activePortalTab === 'bracket' && (
-          <div className="animate-in fade-in duration-200">
-            <SuperAdminBracketManager
-              initialTournamentId={selectedTourneyId}
-              onBracketSaved={() => {
-                setPublishSuccessMessage('Bagan sistem gugur berhasil disimpan dan dipublikasikan!');
-                setTimeout(() => setPublishSuccessMessage(null), 4000);
-              }}
-            />
+        {/* Unified Active Tournament Selector Bar (For Undian Grup, Bagan Bracket, and Skoring Wasit) */}
+        {(activePortalTab === 'group-draw' || activePortalTab === 'bracket' || (activePortalTab === 'referee' && liveTournaments.length > 0)) && (
+          <div className="p-4 rounded-2xl bg-white border border-[#D8DFDE] shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-in fade-in duration-150">
+            <div className="flex items-center gap-2.5">
+              <div className="w-9 h-9 rounded-xl bg-[#006A6A]/10 text-[#006A6A] flex items-center justify-center shrink-0">
+                <Trophy className="w-4 h-4" />
+              </div>
+              <div>
+                <div className="text-[10px] font-mono uppercase text-[#6F7978] font-bold">
+                  Turnamen yang Sedang Dikelola:
+                </div>
+                <div className="text-xs font-bold text-[#191C1C] flex items-center gap-2 flex-wrap">
+                  <span>{tournaments.find((t) => t.id === selectedTourneyId)?.name || 'Pilih Turnamen'}</span>
+                  <span className="text-[#6F7978] font-normal">
+                    · {tournaments.find((t) => t.id === selectedTourneyId)?.location}
+                  </span>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                    tournaments.find((t) => t.id === selectedTourneyId)?.status === 'Live'
+                      ? 'bg-emerald-100 text-emerald-800'
+                      : tournaments.find((t) => t.id === selectedTourneyId)?.status === 'Akan Datang'
+                      ? 'bg-amber-100 text-amber-900'
+                      : 'bg-neutral-100 text-neutral-700'
+                  }`}>
+                    {tournaments.find((t) => t.id === selectedTourneyId)?.status}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <label className="text-[11px] font-mono text-[#3D5A57] font-bold uppercase whitespace-nowrap">
+                Ganti Turnamen{activePortalTab === 'referee' ? ' (Live)' : ''}:
+              </label>
+              <select
+                value={selectedTourneyId}
+                onChange={(e) => setSelectedTourneyId(e.target.value)}
+                className="px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-[#F6FAF9] text-xs font-bold text-[#191C1C] focus:outline-none focus:border-[#006A6A] cursor-pointer"
+              >
+                {activePortalTab === 'referee' ? (
+                  liveTournaments.length === 0 ? (
+                    <option value="" disabled>
+                      (Tidak Ada Turnamen Live)
+                    </option>
+                  ) : (
+                    liveTournaments.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.name} ({t.location}) · [LIVE]
+                      </option>
+                    ))
+                  )
+                ) : tournaments.length === 0 ? (
+                  <option value="" disabled>
+                    (Belum Ada Turnamen)
+                  </option>
+                ) : (
+                  tournaments.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name} ({t.location}) · [{t.status}]
+                    </option>
+                  ))
+                )}
+              </select>
+            </div>
           </div>
         )}
 
-        {/* TAB 2: REFEREE LIVE SCORING SHEET */}
-        {activePortalTab === 'referee' && (
-          <div className="space-y-6 animate-in fade-in duration-200">
-            {/* Toast confirmation */}
-            {publishSuccessMessage && (
-              <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-300 text-emerald-900 shadow-md flex items-center justify-between animate-in slide-in-from-top-2 duration-200">
-                <div className="flex items-center gap-2.5 text-xs font-semibold">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
-                  <span>{publishSuccessMessage}</span>
+        {/* TAB 0: MANAJEMEN TURNAMEN (BUAT, EDIT, HAPUS & STATUS) - HANYA AKSES ADMIN */}
+        {activePortalTab === 'tournament-manager' && (
+          <div className="animate-in fade-in duration-200">
+            {isAdminUser ? (
+              <AdminTournamentManager
+                onOpenTournamentDetail={(id) => {
+                  setSelectedTourneyId(id);
+                  onBackToGuest();
+                }}
+                onNavigateToBracket={(id) => {
+                  setSelectedTourneyId(id);
+                  setActivePortalTab('bracket');
+                }}
+                onNavigateToReferee={(id) => {
+                  setSelectedTourneyId(id);
+                  setActivePortalTab('referee');
+                }}
+              />
+            ) : (
+              <div className="p-8 rounded-3xl bg-white border border-[#D8DFDE] text-center space-y-3">
+                <div className="w-12 h-12 rounded-2xl bg-amber-100 text-amber-800 flex items-center justify-center mx-auto">
+                  <Lock className="w-6 h-6" />
                 </div>
-                <button
-                  onClick={() => setPublishSuccessMessage(null)}
-                  className="text-xs font-bold text-emerald-700 underline"
-                >
-                  Tutup
-                </button>
+                <h3 className="text-base font-bold text-[#191C1C]">Akses Terbatas: Hanya Administrator Turnamen</h3>
+                <p className="text-xs text-[#6F7978] max-w-md mx-auto">
+                  Halaman pembuatan dan pengelolaan status turnamen hanya dapat diakses oleh user dengan tipe Administrator (admin). Akun wasit hanya memiliki izin pengisian lembar skoring pertandingan.
+                </p>
               </div>
             )}
+          </div>
+        )}
+
+        {/* TAB 1: MANAJEMEN MEMBER KLUB & FOTO (HANYA AKSES ADMIN) */}
+        {activePortalTab === 'member' && (
+          <div className="animate-in fade-in duration-200">
+            {isAdminUser ? (
+              <AdminMemberManager
+                onMemberUpdated={() => {
+                  setPublishSuccessMessage('Data member klub dan foto berhasil disinkronkan ke seluruh sistem!');
+                  setTimeout(() => setPublishSuccessMessage(null), 4000);
+                }}
+              />
+            ) : (
+              <div className="p-8 rounded-3xl bg-white border border-[#D8DFDE] text-center space-y-3">
+                <div className="w-12 h-12 rounded-2xl bg-amber-100 text-amber-800 flex items-center justify-center mx-auto">
+                  <Lock className="w-6 h-6" />
+                </div>
+                <h3 className="text-base font-bold text-[#191C1C]">Akses Terbatas: Hanya Administrator Turnamen</h3>
+                <p className="text-xs text-[#6F7978] max-w-md mx-auto">
+                  Halaman penambahan dan pengelolaan member klub hanya dapat diakses oleh akun Administrator. Akun wasit hanya memiliki izin pengisian lembar skor.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* TAB BARU: ALOKASI MEMBER KE POOL / GRUP TURNAMEN (DATABASE SQLITE TERPUSAT) */}
+        {activePortalTab === 'pool-allocation' && (
+          <div className="animate-in fade-in duration-200">
+            {isAdminUser ? (
+              <AdminMemberPoolAllocation
+                initialTournamentId={selectedTourneyId}
+                onAllocationChanged={() => {
+                  setPublishSuccessMessage('Penempatan member ke pool berhasil disimpan ke Database SQLite!');
+                  setTimeout(() => setPublishSuccessMessage(null), 4000);
+                }}
+              />
+            ) : (
+              <div className="p-8 rounded-3xl bg-white border border-[#D8DFDE] text-center space-y-3">
+                <div className="w-12 h-12 rounded-2xl bg-amber-100 text-amber-800 flex items-center justify-center mx-auto">
+                  <Lock className="w-6 h-6" />
+                </div>
+                <h3 className="text-base font-bold text-[#191C1C]">Akses Terbatas: Hanya Administrator Turnamen</h3>
+                <p className="text-xs text-[#6F7978] max-w-md mx-auto">
+                  Fitur alokasi dan penempatan member ke grup/pool turnamen hanya dapat diakses oleh akun Administrator.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* TAB 2: UNDIAN & PENERAPAN PEMAIN KE GRUP (ADMIN) */}
+        {activePortalTab === 'group-draw' && (
+          <div className="animate-in fade-in duration-200">
+            {isAdminUser ? (
+              <AdminGroupDrawManager
+                initialTournamentId={selectedTourneyId}
+                onGroupsSaved={() => {
+                  setPublishSuccessMessage('Susunan grup turnamen berhasil diperbarui!');
+                  setTimeout(() => setPublishSuccessMessage(null), 4000);
+                }}
+              />
+            ) : (
+              <div className="p-8 rounded-3xl bg-white border border-[#D8DFDE] text-center space-y-3">
+                <div className="w-12 h-12 rounded-2xl bg-amber-100 text-amber-800 flex items-center justify-center mx-auto">
+                  <Lock className="w-6 h-6" />
+                </div>
+                <h3 className="text-base font-bold text-[#191C1C]">Akses Terbatas: Hanya Administrator Turnamen</h3>
+                <p className="text-xs text-[#6F7978] max-w-md mx-auto">
+                  Fitur pembagian grup dan undian acak hanya dapat dijalankan oleh akun Administrator.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* TAB 3: SUPER ADMIN BRACKET MANAGER */}
+        {activePortalTab === 'bracket' && (
+          <div className="animate-in fade-in duration-200">
+            {isAdminUser ? (
+              <SuperAdminBracketManager
+                initialTournamentId={selectedTourneyId}
+                onBracketSaved={() => {
+                  setPublishSuccessMessage('Bagan sistem gugur berhasil disimpan dan dipublikasikan!');
+                  setTimeout(() => setPublishSuccessMessage(null), 4000);
+                }}
+            />
+            ) : (
+              <div className="p-8 rounded-3xl bg-white border border-[#D8DFDE] text-center space-y-3">
+                <div className="w-12 h-12 rounded-2xl bg-amber-100 text-amber-800 flex items-center justify-center mx-auto">
+                  <Lock className="w-6 h-6" />
+                </div>
+                <h3 className="text-base font-bold text-[#191C1C]">Akses Terbatas: Hanya Administrator Turnamen</h3>
+                <p className="text-xs text-[#6F7978] max-w-md mx-auto">
+                  Fitur Bagan Bracket hanya dapat dijalankan oleh akun Administrator.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* TAB 4: REFEREE LIVE SCORING SHEET */}
+        {activePortalTab === 'referee' && (
+          liveTournaments.length === 0 ? (
+            <div className="p-8 sm:p-14 rounded-3xl bg-white border border-[#D8DFDE] shadow-xs text-center space-y-4 max-w-xl mx-auto my-10 animate-in fade-in duration-200">
+              <div className="w-16 h-16 rounded-2xl bg-amber-50 border border-amber-200 text-amber-600 flex items-center justify-center mx-auto shadow-inner">
+                <Radio className="w-8 h-8 opacity-60 text-amber-600" />
+              </div>
+              <div className="space-y-2">
+                <h3 className="text-xl font-black text-[#191C1C] font-display">
+                  Tidak Ada Turnamen dengan Status Live Saat Ini
+                </h3>
+                <p className="text-xs sm:text-sm text-[#6F7978] leading-relaxed max-w-md mx-auto">
+                  Laman skoring wasit dinonaktifkan sementara karena saat ini tidak ada turnamen yang berstatus Live. Lembar skoring hanya dapat diakses saat pertandingan aktif berlangsung guna menghindari kesalahan pemberian skor pada turnamen yang telah selesai.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-6 animate-in fade-in duration-200">
+              {/* Toast confirmation */}
+              {publishSuccessMessage && (
+                <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-300 text-emerald-900 shadow-md flex items-center justify-between animate-in slide-in-from-top-2 duration-200">
+                  <div className="flex items-center gap-2.5 text-xs font-semibold">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                    <span>{publishSuccessMessage}</span>
+                  </div>
+                  <button
+                    onClick={() => setPublishSuccessMessage(null)}
+                    className="text-xs font-bold text-emerald-700 underline"
+                  >
+                    Tutup
+                  </button>
+                </div>
+              )}
 
             {/* Referee Dashboard Controller Header */}
             <div className="p-6 rounded-3xl bg-white border border-[#D8DFDE] shadow-xs space-y-5">
@@ -627,17 +1441,22 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
             {/* Select Tournament */}
             <div>
               <label className="block text-[#6F7978] font-mono text-[11px] uppercase font-bold mb-1">
-                Turnamen:
+                Turnamen Live:
               </label>
               <select
                 value={selectedTourneyId}
                 onChange={(e) => setSelectedTourneyId(e.target.value)}
                 className="w-full px-3 py-2 rounded-xl border border-[#D8DFDE] bg-[#F6FAF9] text-[#191C1C] font-semibold focus:outline-none focus:border-[#006A6A]"
               >
-                <option value="rookie-mix">LagiLagiPadel Rookie Fix Mix (Kemang)</option>
-                <option value="padelpro-open">Jakarta Padel Pro Open 2026 (Satrio)</option>
-                <option value="beginner-cup">Kemang Weekend Beginner Cup</option>
-                <option value="jak-masters">Jakarta Masters Invitational</option>
+                {liveTournaments.length === 0 ? (
+                  <option value="" disabled>(Tidak Ada Turnamen Live)</option>
+                ) : (
+                  liveTournaments.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name} ({t.location}) · [LIVE]
+                    </option>
+                  ))
+                )}
               </select>
             </div>
 
@@ -666,35 +1485,73 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
 
             {/* Select Phase */}
             <div>
-              <label className="block text-[#6F7978] font-mono text-[11px] uppercase font-bold mb-1">
-                Babak Pertandingan:
-              </label>
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-[#6F7978] font-mono text-[11px] uppercase font-bold">
+                  Babak Pertandingan:
+                </label>
+                <button
+                  type="button"
+                  onClick={handleLoadTeamsFromBracket}
+                  className="text-[10px] text-[#006A6A] hover:underline font-bold flex items-center gap-1 cursor-pointer"
+                  title="Ambil nama pasangan tim yang terjadwal di bagan sistem gugur untuk babak ini"
+                >
+                  <Users className="w-3 h-3" />
+                  <span>Muat Tim dari Bagan</span>
+                </button>
+              </div>
               <select
                 value={matchPhase}
-                onChange={(e) => {
-                  setMatchPhase(e.target.value);
-                  if (e.target.value === 'Grand Final') {
-                    setTeamAName('Olivia & Rico');
-                    setTeamBName('Kartika & Dodie');
-                  } else if (e.target.value === 'Semifinal 1') {
-                    setTeamAName('Olivia & Rico');
-                    setTeamBName('Fajar & Dimas');
-                  } else if (e.target.value === 'Perebutan Juara 3') {
-                    setTeamAName('Fajar & Dimas');
-                    setTeamBName('Kartika & Dodie');
-                  } else {
-                    setTeamAName('Tim A Pool');
-                    setTeamBName('Tim B Pool');
-                  }
-                }}
-                className="w-full px-3 py-2 rounded-xl border border-[#D8DFDE] bg-[#F6FAF9] text-[#191C1C] font-semibold focus:outline-none focus:border-[#006A6A]"
+                onChange={(e) => setMatchPhase(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl border border-[#D8DFDE] bg-[#F6FAF9] text-[#191C1C] font-semibold focus:outline-none focus:border-[#006A6A] cursor-pointer"
               >
-                <option value="Grand Final">Grand Final (Gold Match)</option>
-                <option value="Perebutan Juara 3">Perebutan Juara 3 (Bronze Match)</option>
-                <option value="Semifinal 1">Semifinal 1</option>
-                <option value="Semifinal 2">Semifinal 2</option>
-                <option value="Pool A Match">Pool A Match</option>
-                <option value="Pool B Match">Pool B Match</option>
+                <optgroup
+                  label={`Babak Sistem Gugur (${activePoolCount} Pool · ${
+                    hasRoundOf16
+                      ? 'R16, QF, SF & Final'
+                      : hasQuarters
+                      ? 'QF, SF & Final'
+                      : hasSemis
+                      ? 'SF & Final'
+                      : 'Grand Final'
+                  })`}
+                >
+                  <option value="Grand Final">Grand Final (Gold Match)</option>
+                  <option value="Perebutan Juara 3">Perebutan Juara 3 (Bronze Match)</option>
+                  {hasSemis && (
+                    <>
+                      <option value="Semifinal 1">Semifinal 1</option>
+                      <option value="Semifinal 2">Semifinal 2</option>
+                    </>
+                  )}
+                  {hasQuarters && (
+                    <>
+                      <option value="Perempat Final 1">Perempat Final 1 (QF 1)</option>
+                      <option value="Perempat Final 2">Perempat Final 2 (QF 2)</option>
+                      <option value="Perempat Final 3">Perempat Final 3 (QF 3)</option>
+                      <option value="Perempat Final 4">Perempat Final 4 (QF 4)</option>
+                    </>
+                  )}
+                  {hasRoundOf16 && (
+                    <>
+                      <option value="Babak 16 Besar 1">Babak 16 Besar (R16 #1)</option>
+                      <option value="Babak 16 Besar 2">Babak 16 Besar (R16 #2)</option>
+                      <option value="Babak 16 Besar 3">Babak 16 Besar (R16 #3)</option>
+                      <option value="Babak 16 Besar 4">Babak 16 Besar (R16 #4)</option>
+                      <option value="Babak 16 Besar 5">Babak 16 Besar (R16 #5)</option>
+                      <option value="Babak 16 Besar 6">Babak 16 Besar (R16 #6)</option>
+                      <option value="Babak 16 Besar 7">Babak 16 Besar (R16 #7)</option>
+                      <option value="Babak 16 Besar 8">Babak 16 Besar (R16 #8)</option>
+                    </>
+                  )}
+                </optgroup>
+
+                <optgroup label={`Babak Penyisihan Grup (${activePoolCount} Pool Aktif)`}>
+                  {activePools.map((p) => (
+                    <option key={p} value={`${p} Match`}>
+                      {p} Match
+                    </option>
+                  ))}
+                </optgroup>
               </select>
             </div>
           </div>
@@ -737,7 +1594,7 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
             <div>
               <div className="flex items-center gap-2">
                 <span className="text-[10px] font-mono uppercase tracking-widest text-[#006A6A] font-bold">
-                  {selectedTourneyData.name}
+                  {selectedTourneyData ? selectedTourneyData.name : 'Belum Ada Turnamen Aktif (Skoring Mandiri)'}
                 </span>
                 <span className="text-xs text-[#6F7978]">·</span>
                 <span className="text-xs font-mono font-bold text-[#191C1C]">
@@ -785,29 +1642,128 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
             </div>
           </div>
 
-          {/* Teams Input Edit (Wasit bisa edit nama pasangan bila perlu) */}
+          {/* Teams Dropdown Selection (Otomatis menyesuaikan Babak Pertandingan & Pool yang dipilih) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pb-2">
             <div>
-              <label className="block text-[11px] font-mono text-[#6F7978] uppercase mb-1">
-                Nama Pasangan Tim A:
-              </label>
-              <input
-                type="text"
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-[11px] font-mono text-[#6F7978] uppercase font-bold">
+                  Nama Pasangan Tim A:
+                </label>
+                <span className="text-[10px] font-mono text-[#006A6A] font-semibold">
+                  {phaseTeamSelection.mode === 'pool'
+                    ? `${phaseTeamSelection.poolName} (${phaseTeamSelection.primaryTeams.length} Tim)`
+                    : `Bagan ${matchPhase}`}
+                </span>
+              </div>
+              <select
                 value={teamAName}
-                onChange={(e) => setTeamAName(e.target.value)}
-                className="w-full px-3 py-1.5 rounded-lg border border-[#D8DFDE] text-xs font-bold text-[#191C1C] bg-[#F6FAF9] focus:outline-none focus:border-[#006A6A]"
-              />
+                onChange={(e) => {
+                  const chosenA = e.target.value;
+                  setTeamAName(chosenA);
+                  if (chosenA === teamBName && phaseTeamSelection.primaryTeams.length >= 2) {
+                    const alt = phaseTeamSelection.primaryTeams.find((t) => t.name !== chosenA);
+                    if (alt) setTeamBName(alt.name);
+                  }
+                }}
+                className="w-full px-3 py-2 rounded-xl border border-[#D8DFDE] text-xs font-bold text-[#191C1C] bg-[#F6FAF9] focus:outline-none focus:border-[#006A6A] cursor-pointer"
+              >
+                {phaseTeamSelection.mode === 'pool' ? (
+                  phaseTeamSelection.primaryTeams.length > 0 ? (
+                    <optgroup label={`Daftar Pasangan ${phaseTeamSelection.poolName}`}>
+                      {phaseTeamSelection.primaryTeams.map((t) => (
+                        <option key={`a-${t.pool}-${t.name}`} value={t.name}>
+                          {t.name} ({t.p1} / {t.p2})
+                        </option>
+                      ))}
+                    </optgroup>
+                  ) : (
+                    <option value={teamAName}>{teamAName || 'Tim A (TBD)'}</option>
+                  )
+                ) : (
+                  <>
+                    {phaseTeamSelection.bracketPair && (
+                      <optgroup label={`Jadwal Bagan: ${matchPhase}`}>
+                        <option value={phaseTeamSelection.bracketPair.team1}>
+                          {phaseTeamSelection.bracketPair.team1} (Slot 1 Bagan)
+                        </option>
+                        <option value={phaseTeamSelection.bracketPair.team2}>
+                          {phaseTeamSelection.bracketPair.team2} (Slot 2 Bagan)
+                        </option>
+                      </optgroup>
+                    )}
+                    {phaseTeamSelection.allPools.map((pg) => (
+                      <optgroup key={`a-group-${pg.poolName}`} label={`Pasangan dari ${pg.poolName}`}>
+                        {pg.teams.map((t) => (
+                          <option key={`a-${pg.poolName}-${t.name}`} value={t.name}>
+                            {t.name} ({pg.poolName})
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </>
+                )}
+              </select>
             </div>
+
             <div>
-              <label className="block text-[11px] font-mono text-[#6F7978] uppercase mb-1">
-                Nama Pasangan Tim B:
-              </label>
-              <input
-                type="text"
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-[11px] font-mono text-[#6F7978] uppercase font-bold">
+                  Nama Pasangan Tim B:
+                </label>
+                <span className="text-[10px] font-mono text-[#006A6A] font-semibold">
+                  {phaseTeamSelection.mode === 'pool'
+                    ? `${phaseTeamSelection.poolName} (${phaseTeamSelection.primaryTeams.length} Tim)`
+                    : `Bagan ${matchPhase}`}
+                </span>
+              </div>
+              <select
                 value={teamBName}
-                onChange={(e) => setTeamBName(e.target.value)}
-                className="w-full px-3 py-1.5 rounded-lg border border-[#D8DFDE] text-xs font-bold text-[#191C1C] bg-[#F6FAF9] focus:outline-none focus:border-[#006A6A]"
-              />
+                onChange={(e) => {
+                  const chosenB = e.target.value;
+                  setTeamBName(chosenB);
+                  if (chosenB === teamAName && phaseTeamSelection.primaryTeams.length >= 2) {
+                    const alt = phaseTeamSelection.primaryTeams.find((t) => t.name !== chosenB);
+                    if (alt) setTeamAName(alt.name);
+                  }
+                }}
+                className="w-full px-3 py-2 rounded-xl border border-[#D8DFDE] text-xs font-bold text-[#191C1C] bg-[#F6FAF9] focus:outline-none focus:border-[#006A6A] cursor-pointer"
+              >
+                {phaseTeamSelection.mode === 'pool' ? (
+                  phaseTeamSelection.primaryTeams.length > 0 ? (
+                    <optgroup label={`Daftar Pasangan ${phaseTeamSelection.poolName}`}>
+                      {phaseTeamSelection.primaryTeams.map((t) => (
+                        <option key={`b-${t.pool}-${t.name}`} value={t.name}>
+                          {t.name} ({t.p1} / {t.p2})
+                        </option>
+                      ))}
+                    </optgroup>
+                  ) : (
+                    <option value={teamBName}>{teamBName || 'Tim B (TBD)'}</option>
+                  )
+                ) : (
+                  <>
+                    {phaseTeamSelection.bracketPair && (
+                      <optgroup label={`Jadwal Bagan: ${matchPhase}`}>
+                        <option value={phaseTeamSelection.bracketPair.team2}>
+                          {phaseTeamSelection.bracketPair.team2} (Slot 2 Bagan)
+                        </option>
+                        <option value={phaseTeamSelection.bracketPair.team1}>
+                          {phaseTeamSelection.bracketPair.team1} (Slot 1 Bagan)
+                        </option>
+                      </optgroup>
+                    )}
+                    {phaseTeamSelection.allPools.map((pg) => (
+                      <optgroup key={`b-group-${pg.poolName}`} label={`Pasangan dari ${pg.poolName}`}>
+                        {pg.teams.map((t) => (
+                          <option key={`b-${pg.poolName}-${t.name}`} value={t.name}>
+                            {t.name} ({pg.poolName})
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </>
+                )}
+              </select>
             </div>
           </div>
 
@@ -973,14 +1929,26 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
                 <RotateCcw className="w-3.5 h-3.5" />
                 <span>Reset Game (0-0)</span>
               </button>
+
+              <button
+                onClick={() => clearStoredRefereeState()}
+                className="px-3.5 py-2 rounded-xl bg-red-50 hover:bg-red-100 text-[#BA1A1A] font-semibold transition-colors flex items-center gap-1 cursor-pointer border border-red-200"
+                title="Kosongkan seluruh skor game, set, dan riwayat lembar wasit (0-0)"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Kosongkan Skor Wasit (0-0)</span>
+              </button>
             </div>
 
+            {/* Tombol Selesai dan Publikasikan Skor ke Sistem Tamu */}
             <button
-              onClick={handlePublishToLive}
-              className="px-5 py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white font-bold transition-all flex items-center gap-2 cursor-pointer shadow-md shadow-emerald-700/20"
+              type="button"
+              onClick={handleOpenFinishConfirmModal}
+              className="px-5 py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white font-black text-xs transition-all flex items-center gap-2 cursor-pointer shadow-md shadow-emerald-700/20 active:scale-98"
+              title="Selesaikan pertandingan ini dan publikasikan skor resmi ke sistem tamu serta otomatis loloskan pemenang di bracket"
             >
               <CheckCircle2 className="w-4 h-4" />
-              <span>Publikasikan Skor ke Sistem Tamu</span>
+              <span>Selesai dan Publikasikan Skor ke Sistem Tamu</span>
             </button>
           </div>
         </div>
@@ -1021,45 +1989,186 @@ export const RefereeAdminPortal: React.FC<RefereeAdminPortalProps> = ({
               <span>Log Skor Wasit Real-time</span>
             </h4>
             <div className="space-y-1.5 text-xs text-[#3D5A57] font-mono max-h-44 overflow-y-auto pr-1">
-              {scoreHistory.map((item, idx) => (
-                <div
-                  key={idx}
-                  className="flex items-center gap-2 p-2 rounded-lg bg-[#F6FAF9] border border-[#D8DFDE] text-[#191C1C]"
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-[#006A6A] shrink-0" />
-                  <span className="truncate">{item}</span>
+              {scoreHistory.length === 0 ? (
+                <div className="p-4 text-center text-[#6F7978] bg-[#F6FAF9] rounded-xl border border-dashed border-[#D8DFDE] text-xs">
+                  Belum ada riwayat skor pertandingan tercatat (data skoring wasit dikosongkan).
                 </div>
-              ))}
+              ) : (
+                scoreHistory.map((item, idx) => (
+                  <div
+                    key={idx}
+                    className="flex items-center gap-2 p-2 rounded-lg bg-[#F6FAF9] border border-[#D8DFDE] text-[#191C1C]"
+                  >
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#006A6A] shrink-0" />
+                    <span className="truncate">{item}</span>
+                  </div>
+                ))
+              )}
             </div>
           </div>
         </div>
-          </div>
+            </div>
+          )
         )}
 
         {/* Bottom Exit Bar */}
-        <div className="p-4 rounded-2xl bg-[#EEF4F3] border border-[#D8DFDE] flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-          <div className="flex items-center gap-2 text-[#3D5A57]">
-            <ShieldCheck className="w-4 h-4 text-[#006A6A]" />
-            <span>Mode Wasit Aktif. Semua penambahan poin tersimpan secara lokal dan dapat disinkronkan ke tamu.</span>
-          </div>
+        {!(activePortalTab === 'referee' && liveTournaments.length === 0) && (
+          <div className="p-4 rounded-2xl bg-[#EEF4F3] border border-[#D8DFDE] flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2 text-[#3D5A57]">
+              <ShieldCheck className="w-4 h-4 text-[#006A6A]" />
+              <span>Mode Wasit Aktif. Semua penambahan poin tersimpan secara lokal dan dapat disinkronkan ke tamu.</span>
+            </div>
 
-          <div className="flex items-center gap-2 self-start sm:self-auto">
-            <button
-              onClick={handleLogout}
-              className="px-3.5 py-2 rounded-xl bg-neutral-200 hover:bg-neutral-300 text-neutral-800 font-bold border border-neutral-300 transition-all cursor-pointer inline-flex items-center gap-1.5"
-            >
-              <LogOut className="w-3.5 h-3.5" />
-              <span>Logout Wasit</span>
-            </button>
-            <button
-              onClick={onBackToGuest}
-              className="px-4 py-2 rounded-xl bg-white hover:bg-[#D8DFDE] text-[#191C1C] font-bold border border-[#CBD5D4] transition-all cursor-pointer"
-            >
-              ← Kembali ke Mode Tamu
-            </button>
+            <div className="flex items-center gap-2 self-start sm:self-auto">
+              <button
+                onClick={handleLogout}
+                className="px-3.5 py-2 rounded-xl bg-neutral-200 hover:bg-neutral-300 text-neutral-800 font-bold border border-neutral-300 transition-all cursor-pointer inline-flex items-center gap-1.5"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Logout Wasit</span>
+              </button>
+              <button
+                onClick={onBackToGuest}
+                className="px-4 py-2 rounded-xl bg-white hover:bg-[#D8DFDE] text-[#191C1C] font-bold border border-[#CBD5D4] transition-all cursor-pointer"
+              >
+                ← Kembali ke Mode Tamu
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* MODAL PERINGATAN & KONFIRMASI: SELESAIKAN PERTANDINGAN & PUBLIKASIKAN KE SISTEM TAMU */}
+      {showFinishConfirmModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs animate-in fade-in duration-200">
+          <div className="w-full max-w-lg bg-white rounded-3xl border border-[#D8DFDE] shadow-2xl p-6 sm:p-7 space-y-5 animate-in zoom-in-95 duration-200">
+            {/* Header Icon & Title */}
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-12 h-12 rounded-2xl bg-amber-100 border border-amber-300 flex items-center justify-center text-amber-800 shrink-0 shadow-xs">
+                  <AlertTriangle className="w-6 h-6 text-amber-700" />
+                </div>
+                <div>
+                  <span className="text-[10px] font-mono uppercase font-bold text-amber-800 tracking-wider">
+                    Peringatan & Konfirmasi Meja Wasit
+                  </span>
+                  <h3 className="text-lg font-black text-[#191C1C] font-display">
+                    Selesaikan Pertandingan & Publikasikan
+                  </h3>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowFinishConfirmModal(false)}
+                className="p-1.5 rounded-xl text-[#6F7978] hover:text-[#191C1C] hover:bg-[#F6FAF9] cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Kotak Peringatan & Pertanyaan Sesuai Permintaan User */}
+            <div className="p-4 rounded-2xl bg-amber-50 border border-amber-300 text-amber-950 space-y-2">
+              <p className="text-sm font-black text-amber-950 leading-relaxed">
+                Apakah pertandingan sudah selesai dan akan mempublikasikan skor ke sistem tamu?
+              </p>
+              <p className="text-xs text-amber-800 leading-relaxed">
+                Jika Anda memilih <strong>Ya</strong>, maka pertandingan ini resmi dinyatakan selesai. Tim yang menang akan <strong>otomatis lolos ke babak berikutnya di bagan sistem gugur (bracket)</strong> dan hasil akhir langsung tercatat di sistem tamu.
+              </p>
+            </div>
+
+            {/* Ringkasan Skor & Babak Pertandingan */}
+            <div className="p-4 rounded-2xl bg-[#F6FAF9] border border-[#D8DFDE] space-y-3 text-xs">
+              <div className="flex items-center justify-between pb-2 border-b border-[#D8DFDE] text-[#6F7978] font-mono text-[11px]">
+                <span className="font-bold text-[#191C1C]">{selectedTourneyData?.name || 'Turnamen Aktif'}</span>
+                <span className="font-bold text-[#006A6A]">{matchPhase} (Court #{activeCourt})</span>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="font-bold text-[#191C1C] text-sm">{teamAName}</div>
+                  <div className="font-mono font-bold text-[#006A6A]">
+                    Set: {currentSetA} · Games: {gamesTeamA} · Poin: {pointLabels[courtScoreA]}
+                  </div>
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="font-bold text-[#191C1C] text-sm">{teamBName}</div>
+                  <div className="font-mono font-bold text-[#006A6A]">
+                    Set: {currentSetB} · Games: {gamesTeamB} · Poin: {pointLabels[courtScoreB]}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Pilihan Tim Pemenang untuk Meloloskan ke Bracket */}
+            <div className="space-y-2">
+              <label className="block text-xs font-mono uppercase font-bold text-[#3D5A57]">
+                Pilih Tim Pemenang yang Otomatis Lolos ke Babak Selanjutnya:
+              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => setSelectedWinnerChoice('A')}
+                  className={`p-3 rounded-2xl border text-left transition-all cursor-pointer flex items-center justify-between ${
+                    selectedWinnerChoice === 'A'
+                      ? 'bg-emerald-50 border-emerald-600 ring-2 ring-emerald-600/30'
+                      : 'bg-[#F6FAF9] border-[#D8DFDE] hover:border-[#006A6A]'
+                  }`}
+                >
+                  <div className="min-w-0 pr-2">
+                    <span className="text-[10px] font-mono text-[#6F7978] uppercase block">Tim A</span>
+                    <span className="text-xs font-bold text-[#191C1C] truncate block">{teamAName}</span>
+                  </div>
+                  {selectedWinnerChoice === 'A' ? (
+                    <CheckCircle2 className="w-5 h-5 text-emerald-700 shrink-0" />
+                  ) : (
+                    <div className="w-4 h-4 rounded-full border border-[#D8DFDE]" />
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setSelectedWinnerChoice('B')}
+                  className={`p-3 rounded-2xl border text-left transition-all cursor-pointer flex items-center justify-between ${
+                    selectedWinnerChoice === 'B'
+                      ? 'bg-emerald-50 border-emerald-600 ring-2 ring-emerald-600/30'
+                      : 'bg-[#F6FAF9] border-[#D8DFDE] hover:border-[#006A6A]'
+                  }`}
+                >
+                  <div className="min-w-0 pr-2">
+                    <span className="text-[10px] font-mono text-[#6F7978] uppercase block">Tim B</span>
+                    <span className="text-xs font-bold text-[#191C1C] truncate block">{teamBName}</span>
+                  </div>
+                  {selectedWinnerChoice === 'B' ? (
+                    <CheckCircle2 className="w-5 h-5 text-emerald-700 shrink-0" />
+                  ) : (
+                    <div className="w-4 h-4 rounded-full border border-[#D8DFDE]" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {/* Tombol Pilihan Ya dan Tidak Sesuai Permintaan User */}
+            <div className="pt-2 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setShowFinishConfirmModal(false)}
+                className="px-5 py-2.5 rounded-xl border border-[#D8DFDE] bg-white hover:bg-neutral-100 text-[#191C1C] font-bold text-xs cursor-pointer transition-all shadow-xs"
+              >
+                Tidak
+              </button>
+
+              <button
+                type="button"
+                onClick={handleConfirmFinishAndPublish}
+                className="px-6 py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white font-black text-xs cursor-pointer shadow-md shadow-emerald-700/20 transition-all flex items-center gap-2 active:scale-98"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                <span>Ya</span>
+              </button>
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };

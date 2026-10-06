@@ -117,6 +117,7 @@ export interface Tournament {
   format: string;
   status: 'Open for Registration' | 'Almost Full' | 'Upcoming' | 'Completed';
   highlights: string[];
+  bannerUrl?: string;
 }
 
 export interface ProductItem {

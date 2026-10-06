@@ -14,17 +14,33 @@ import {
   MapPin,
   ChevronDown,
   Eye,
-  AlertTriangle,
   X
 } from 'lucide-react';
-import { KnockoutMatch, PADEL_TOURNAMENTS_DATA } from '../data/padelProTournamentsData';
+import { KnockoutMatch, TournamentMatch } from '../data/padelProTournamentsData';
+import {
+  getStoredTournaments,
+  saveTournament,
+  getOrGeneratePoolMatches,
+  savePoolMatch
+} from '../data/tournamentStorage';
 import {
   KnockoutBracketData,
   getStoredBracket,
   saveStoredBracket,
-  resetStoredBracket
+  resetStoredBracket,
+  generateBracketForPoolCount
 } from '../data/bracketStorage';
+import { getStoredTournamentGroups } from '../data/tournamentGroupStorage';
 import { KnockoutBracketVisualizer } from './KnockoutBracketVisualizer';
+
+export interface ActiveEditMatch {
+  matchType: 'knockout' | 'pool';
+  roundType?: 'roundOf16' | 'quarters' | 'semis' | 'grandFinal' | 'bronzeMatch';
+  index?: number;
+  poolName?: string;
+  originalPoolMatch?: TournamentMatch;
+  match: KnockoutMatch;
+}
 
 interface SuperAdminBracketManagerProps {
   initialTournamentId?: string;
@@ -35,28 +51,79 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
   initialTournamentId = 'rookie-mix',
   onBracketSaved
 }) => {
+  const [tournaments, setTournaments] = useState(() => getStoredTournaments());
   const [selectedTournament, setSelectedTournament] = useState<string>(initialTournamentId);
   const [bracketData, setBracketData] = useState<KnockoutBracketData>(() =>
     getStoredBracket(initialTournamentId)
   );
-  const [activeRoundTab, setActiveRoundTab] = useState<
-    'all' | 'roundOf16' | 'quarters' | 'semis' | 'finals'
-  >('all');
-  const [editingMatch, setEditingMatch] = useState<{
-    match: KnockoutMatch;
-    roundType: 'roundOf16' | 'quarters' | 'semis' | 'grandFinal' | 'bronzeMatch';
-    index?: number;
-  } | null>(null);
+  const [poolMatches, setPoolMatches] = useState<TournamentMatch[]>(() =>
+    getOrGeneratePoolMatches(initialTournamentId)
+  );
+  const [activeRoundTab, setActiveRoundTab] = useState<string>('all');
+  const [editingMatch, setEditingMatch] = useState<ActiveEditMatch | null>(null);
 
   const [notification, setNotification] = useState<{
     type: 'success' | 'info' | 'warning';
     message: string;
   } | null>(null);
 
+  // Dynamically obtain pools for the selected tournament
+  const tournamentPools: string[] = React.useMemo(() => {
+    if (!selectedTournament) return ['Pool A', 'Pool B'];
+    const groups = getStoredTournamentGroups(selectedTournament);
+    if (groups && groups.length > 0) {
+      return groups.map((g) => g.poolName);
+    }
+    const current = tournaments.find((t) => t.id === selectedTournament);
+    if (current?.groupStandings?.pools) {
+      return current.groupStandings.pools.filter((p) => p !== 'Semua Pool');
+    }
+    return ['Pool A', 'Pool B'];
+  }, [selectedTournament, tournaments]);
+
+  // Sync when initialTournamentId prop changes
+  useEffect(() => {
+    if (initialTournamentId) {
+      setSelectedTournament(initialTournamentId);
+    }
+  }, [initialTournamentId]);
+
+  // Reactive listener for tournament and group updates
+  useEffect(() => {
+    const handleTournamentsUpdate = () => {
+      const updated = getStoredTournaments();
+      setTournaments(updated);
+      if (!updated.some((t) => t.id === selectedTournament)) {
+        setSelectedTournament(updated.length > 0 ? updated[0].id : '');
+      }
+      setBracketData(getStoredBracket(selectedTournament));
+      setPoolMatches(getOrGeneratePoolMatches(selectedTournament));
+    };
+    const handleGroupsUpdate = () => {
+      setPoolMatches(getOrGeneratePoolMatches(selectedTournament));
+    };
+    const handleBracketUpdate = (e: Event) => {
+      const custom = e as CustomEvent;
+      if (!custom.detail?.tournamentId || custom.detail.tournamentId === selectedTournament) {
+        setBracketData(getStoredBracket(selectedTournament));
+      }
+    };
+
+    window.addEventListener('lagilagipadel_tournaments_updated', handleTournamentsUpdate);
+    window.addEventListener('lagilagipadel_groups_updated', handleGroupsUpdate);
+    window.addEventListener('lagilagipadel_bracket_updated', handleBracketUpdate);
+    return () => {
+      window.removeEventListener('lagilagipadel_tournaments_updated', handleTournamentsUpdate);
+      window.removeEventListener('lagilagipadel_groups_updated', handleGroupsUpdate);
+      window.removeEventListener('lagilagipadel_bracket_updated', handleBracketUpdate);
+    };
+  }, [selectedTournament]);
+
   // Sync when tournament changes
   useEffect(() => {
     const data = getStoredBracket(selectedTournament);
     setBracketData(data);
+    setPoolMatches(getOrGeneratePoolMatches(selectedTournament));
   }, [selectedTournament]);
 
   const showToast = (message: string, type: 'success' | 'info' | 'warning' = 'success') => {
@@ -64,6 +131,34 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
     setTimeout(() => {
       setNotification(null);
     }, 4000);
+  };
+
+  // Quick switch knockout format for the selected tournament
+  const handleSwitchKnockoutStage = (newStage: 'final' | 'semis' | 'quarters' | 'roundOf16') => {
+    const poolCount = tournamentPools.length || 2;
+    const newBracket = generateBracketForPoolCount(poolCount, newStage);
+    setBracketData(newBracket);
+    saveStoredBracket(selectedTournament, newBracket);
+
+    const tourney = tournaments.find((t) => t.id === selectedTournament);
+    if (tourney) {
+      const updatedTourney = {
+        ...tourney,
+        knockoutBracket: newBracket
+      };
+      saveTournament(updatedTourney);
+    }
+
+    const stageLabel =
+      newStage === 'final'
+        ? 'Langsung Grand Final (Juara Pool)'
+        : newStage === 'semis'
+        ? 'Babak Semifinal & Final'
+        : newStage === 'quarters'
+        ? 'Babak Perempat Final (QF) s.d. Final'
+        : 'Babak 16 Besar (R16) s.d. Final';
+
+    showToast(`Format bagan sistem gugur berhasil diubah ke: ${stageLabel}`, 'success');
   };
 
   // Save changes to localStorage & trigger global update event
@@ -78,16 +173,10 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
 
   // Reset to original factory tournament bracket
   const handleResetBracket = () => {
-    if (
-      window.confirm(
-        'Apakah Anda yakin ingin mengembalikan bagan sistem gugur ke data awal turnamen?'
-      )
-    ) {
-      const defaultData = resetStoredBracket(selectedTournament);
-      setBracketData(defaultData);
-      showToast('Bagan sistem gugur berhasil dikembalikan ke data awal turnamen.', 'info');
-      if (onBracketSaved) onBracketSaved();
-    }
+    const defaultData = resetStoredBracket(selectedTournament);
+    setBracketData(defaultData);
+    showToast('Bagan sistem gugur berhasil dikembalikan ke data awal turnamen.', 'info');
+    if (onBracketSaved) onBracketSaved();
   };
 
   // Smart Auto-Advance: Takes winners of each round and seeds them to subsequent rounds
@@ -247,22 +336,87 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
     );
   };
 
-  // Open Edit Modal for a match
+  // Open Edit Modal for a knockout match
   const handleOpenEditMatch = (
     match: KnockoutMatch,
     roundType: 'roundOf16' | 'quarters' | 'semis' | 'grandFinal' | 'bronzeMatch',
     index?: number
   ) => {
     setEditingMatch({
+      matchType: 'knockout',
       match: JSON.parse(JSON.stringify(match)),
       roundType,
       index
     });
   };
 
-  // Apply single match edit to the state
+  // Open Edit Modal for a pool match
+  const handleOpenEditPoolMatch = (match: TournamentMatch, poolName: string) => {
+    setEditingMatch({
+      matchType: 'pool',
+      poolName,
+      originalPoolMatch: match,
+      match: {
+        id: match.id,
+        roundTitle: match.round,
+        court: match.court || 'Court 1',
+        time: match.time || '09:00 WIB',
+        team1: {
+          name: match.teamA,
+          players: match.playersA,
+          score: match.scoreA,
+          isWinner: match.winner === 'A'
+        },
+        team2: {
+          name: match.teamB,
+          players: match.playersB,
+          score: match.scoreB,
+          isWinner: match.winner === 'B'
+        },
+        status: match.status
+      }
+    });
+  };
+
+  // Apply match edit to state and persistence
   const handleSaveMatchEdit = () => {
     if (!editingMatch) return;
+
+    // Handle Pool Match Save
+    if (editingMatch.matchType === 'pool') {
+      const { match } = editingMatch;
+      const winnerChoice: 'A' | 'B' | 'live' | 'scheduled' = match.team1.isWinner
+        ? 'A'
+        : match.team2.isWinner
+        ? 'B'
+        : match.status === 'Live'
+        ? 'live'
+        : 'scheduled';
+
+      const updatedTournamentMatch: TournamentMatch = {
+        id: match.id,
+        round: match.roundTitle,
+        roundCategory: 'grup',
+        court: match.court,
+        time: match.time,
+        teamA: match.team1.name,
+        playersA: match.team1.players,
+        teamB: match.team2.name,
+        playersB: match.team2.players,
+        scoreA: match.team1.score,
+        scoreB: match.team2.score,
+        winner: winnerChoice,
+        status: match.status
+      };
+
+      savePoolMatch(selectedTournament, updatedTournamentMatch);
+      setPoolMatches(getOrGeneratePoolMatches(selectedTournament));
+      setEditingMatch(null);
+      showToast(`Pertandingan ${match.roundTitle} berhasil diperbarui & klasemen disinkronkan!`, 'success');
+      return;
+    }
+
+    // Handle Knockout Match Save
     const { match, roundType, index } = editingMatch;
     const updated: KnockoutBracketData = JSON.parse(JSON.stringify(bracketData));
 
@@ -284,7 +438,7 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
     showToast(`Pertandingan ${match.roundTitle} berhasil diperbarui!`, 'success');
   };
 
-  // Inline quick winner toggler
+  // Inline quick winner toggler for Knockout
   const handleToggleWinnerInline = (
     roundType: 'roundOf16' | 'quarters' | 'semis' | 'grandFinal' | 'bronzeMatch',
     index: number | undefined,
@@ -319,6 +473,322 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
     setBracketData(updated);
     saveStoredBracket(selectedTournament, updated);
     showToast(`Pemenang ${target.roundTitle} diset ke Tim ${winnerTeam}!`, 'info');
+  };
+
+  // Inline quick winner toggler for Pool Matches
+  const handleTogglePoolWinnerInline = (match: TournamentMatch, winnerChoice: 'A' | 'B') => {
+    const currentA = match.scoreA && match.scoreA !== '-' ? match.scoreA : winnerChoice === 'A' ? '4' : '2';
+    const currentB = match.scoreB && match.scoreB !== '-' ? match.scoreB : winnerChoice === 'B' ? '4' : '2';
+    const updated: TournamentMatch = {
+      ...match,
+      winner: winnerChoice,
+      status: 'Selesai',
+      scoreA: currentA,
+      scoreB: currentB
+    };
+    savePoolMatch(selectedTournament, updated);
+    setPoolMatches(getOrGeneratePoolMatches(selectedTournament));
+    showToast(
+      `Pemenang ${match.round} diset ke ${winnerChoice === 'A' ? match.teamA : match.teamB}!`,
+      'info'
+    );
+  };
+
+  // Dynamic participant dropdown grouping for modal
+  const getParticipantDropdownGroups = (teamNumber: 1 | 2) => {
+    if (!editingMatch) {
+      return { recommendations: [], poolGroups: [], knockoutWinners: [], placeholders: [] };
+    }
+
+    const currentTourney = tournaments.find((t) => t.id === selectedTournament);
+    const groups = getStoredTournamentGroups(selectedTournament);
+    const roundTitle = editingMatch.match.roundTitle || '';
+    const isPoolMatch = editingMatch.matchType === 'pool';
+
+    // 1. Gather all pool groups and their teams
+    const poolGroupsList: { poolName: string; teams: { name: string; players: string; club?: string; seed?: number }[] }[] = [];
+
+    if (groups && groups.length > 0) {
+      groups.forEach((g) => {
+        poolGroupsList.push({
+          poolName: g.poolName,
+          teams: g.teams.map((t) => ({
+            name: t.name,
+            players: t.p1 && t.p2 ? `${t.p1} / ${t.p2}` : t.name,
+            club: t.club,
+            seed: t.seed
+          }))
+        });
+      });
+    } else if (currentTourney?.groupStandings?.standings) {
+      const pools = currentTourney.groupStandings.pools.filter((p) => p !== 'Semua Pool');
+      pools.forEach((pName) => {
+        const teams = currentTourney.groupStandings.standings
+          .filter((s) => s.pool === pName)
+          .map((s) => ({
+            name: s.name,
+            players: s.p1 && s.p2 ? `${s.p1} / ${s.p2}` : s.name,
+            club: currentTourney.participants?.find((p) => p.teamName === s.name)?.club || '',
+            seed: s.pos
+          }));
+        poolGroupsList.push({ poolName: pName, teams });
+      });
+    }
+
+    // 2. Smart recommendations based on match round and team number
+    const recommendations: { label: string; name: string; players: string }[] = [];
+
+    if (isPoolMatch && editingMatch.poolName) {
+      const pool = poolGroupsList.find((g) => g.poolName === editingMatch.poolName);
+      if (pool) {
+        pool.teams.forEach((t) => {
+          recommendations.push({
+            label: `${t.name} (${editingMatch.poolName} ${t.seed ? `· Seed ${t.seed}` : ''})`,
+            name: t.name,
+            players: t.players
+          });
+        });
+      }
+    } else {
+      const titleLower = roundTitle.toLowerCase();
+      let targetPool = '';
+      if (teamNumber === 1) {
+        if (titleLower.includes('pool a')) targetPool = 'Pool A';
+        else if (titleLower.includes('pool c')) targetPool = 'Pool C';
+        else if (titleLower.includes('pool 1')) targetPool = 'Pool 1';
+      } else {
+        if (titleLower.includes('pool b')) targetPool = 'Pool B';
+        else if (titleLower.includes('pool d')) targetPool = 'Pool D';
+        else if (titleLower.includes('pool 2')) targetPool = 'Pool 2';
+      }
+
+      if (targetPool) {
+        const foundPool = poolGroupsList.find((g) => g.poolName.toLowerCase() === targetPool.toLowerCase());
+        if (foundPool && foundPool.teams.length > 0) {
+          foundPool.teams.forEach((t) => {
+            recommendations.push({
+              label: `${t.name} (${targetPool} ${t.seed ? `· Seed ${t.seed}` : ''})`,
+              name: t.name,
+              players: t.players
+            });
+          });
+        }
+      }
+
+      // Standard placeholders
+      if (teamNumber === 1) {
+        if (titleLower.includes('pool a')) {
+          recommendations.unshift({ label: 'Juara Pool A (Format Standar)', name: 'Juara Pool A', players: 'TBD' });
+        } else if (titleLower.includes('qf 1')) {
+          recommendations.unshift({ label: 'Pemenang QF 1 (Format Standar)', name: 'Pemenang QF 1', players: 'TBD' });
+        } else if (titleLower.includes('semifinal 1')) {
+          recommendations.unshift({ label: 'Pemenang Semifinal 1 (Format Standar)', name: 'Pemenang Semifinal 1', players: 'TBD' });
+        }
+      } else {
+        if (titleLower.includes('pool b')) {
+          recommendations.unshift({ label: 'Runner-up Pool B (Format Standar)', name: 'Runner-up Pool B', players: 'TBD' });
+        } else if (titleLower.includes('qf 2')) {
+          recommendations.unshift({ label: 'Pemenang QF 2 (Format Standar)', name: 'Pemenang QF 2', players: 'TBD' });
+        } else if (titleLower.includes('semifinal 2')) {
+          recommendations.unshift({ label: 'Pemenang Semifinal 2 (Format Standar)', name: 'Pemenang Semifinal 2', players: 'TBD' });
+        }
+      }
+    }
+
+    // 3. Knockout previous winners
+    const knockoutWinners: { label: string; name: string; players: string }[] = [];
+    if (bracketData.quarters) {
+      bracketData.quarters.forEach((q, idx) => {
+        const w = q.team1.isWinner ? q.team1 : q.team2.isWinner ? q.team2 : null;
+        if (w && w.name && !w.name.toLowerCase().includes('menunggu') && !w.name.toLowerCase().includes('tbd')) {
+          knockoutWinners.push({
+            label: `${w.name} (Pemenang QF ${idx + 1})`,
+            name: w.name,
+            players: w.players || 'TBD'
+          });
+        }
+      });
+    }
+    if (bracketData.semis) {
+      bracketData.semis.forEach((s, idx) => {
+        const w = s.team1.isWinner ? s.team1 : s.team2.isWinner ? s.team2 : null;
+        if (w && w.name && !w.name.toLowerCase().includes('menunggu') && !w.name.toLowerCase().includes('tbd')) {
+          knockoutWinners.push({
+            label: `${w.name} (Pemenang Semifinal ${idx + 1})`,
+            name: w.name,
+            players: w.players || 'TBD'
+          });
+        }
+      });
+    }
+
+    // 4. Standard Placeholders
+    const placeholders = [
+      { label: 'Juara Pool A', name: 'Juara Pool A', players: 'TBD' },
+      { label: 'Runner-up Pool A', name: 'Runner-up Pool A', players: 'TBD' },
+      { label: 'Juara Pool B', name: 'Juara Pool B', players: 'TBD' },
+      { label: 'Runner-up Pool B', name: 'Runner-up Pool B', players: 'TBD' },
+      { label: 'Juara Pool C', name: 'Juara Pool C', players: 'TBD' },
+      { label: 'Runner-up Pool C', name: 'Runner-up Pool C', players: 'TBD' },
+      { label: 'Juara Pool D', name: 'Juara Pool D', players: 'TBD' },
+      { label: 'Runner-up Pool D', name: 'Runner-up Pool D', players: 'TBD' },
+      { label: 'Pemenang QF 1', name: 'Pemenang QF 1', players: 'TBD' },
+      { label: 'Pemenang QF 2', name: 'Pemenang QF 2', players: 'TBD' },
+      { label: 'Pemenang QF 3', name: 'Pemenang QF 3', players: 'TBD' },
+      { label: 'Pemenang QF 4', name: 'Pemenang QF 4', players: 'TBD' },
+      { label: 'Pemenang Semifinal 1', name: 'Pemenang Semifinal 1', players: 'TBD' },
+      { label: 'Pemenang Semifinal 2', name: 'Pemenang Semifinal 2', players: 'TBD' },
+      { label: 'Kalah Semifinal 1', name: 'Kalah Semifinal 1', players: 'TBD' },
+      { label: 'Kalah Semifinal 2', name: 'Kalah Semifinal 2', players: 'TBD' },
+      { label: 'Finalis 1', name: 'Finalis 1', players: 'TBD' },
+      { label: 'Finalis 2', name: 'Finalis 2', players: 'TBD' },
+      { label: 'Bye', name: 'Bye', players: 'Bye' }
+    ];
+
+    return {
+      recommendations,
+      poolGroups: poolGroupsList,
+      knockoutWinners,
+      placeholders
+    };
+  };
+
+  // Helper render for pool matches (both finished & scheduled)
+  const renderPoolMatchRow = (match: TournamentMatch, poolName: string) => {
+    const isWinnerA = match.winner === 'A';
+    const isWinnerB = match.winner === 'B';
+    const isLive = match.status === 'Live';
+
+    return (
+      <div
+        key={match.id}
+        className={`p-4 rounded-2xl border transition-all shadow-xs space-y-3 ${
+          isLive
+            ? 'bg-gradient-to-r from-red-50 to-white border-red-300 ring-1 ring-red-400'
+            : 'bg-white border-[#D8DFDE] hover:border-[#006A6A]'
+        }`}
+      >
+        {/* Match Header */}
+        <div className="flex items-center justify-between pb-2 border-b border-[#D8DFDE]">
+          <div className="flex items-center gap-2">
+            <span className="bg-[#006A6A] text-white text-[10px] font-black uppercase px-2.5 py-0.5 rounded-md tracking-wider">
+              {match.court || 'COURT #1'}
+            </span>
+            <span className="text-xs font-bold font-mono text-[#191C1C]">
+              {match.round}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span
+              className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-md ${
+                match.status === 'Live'
+                  ? 'bg-red-600 text-white animate-pulse'
+                  : match.status === 'Selesai'
+                  ? 'bg-emerald-100 text-emerald-800'
+                  : 'bg-[#EEF4F3] text-[#3D5A57]'
+              }`}
+            >
+              {match.status === 'Live' ? '● LIVE' : match.status === 'Selesai' ? '✓ SELESAI' : '🕒 ' + match.time}
+            </span>
+            <button
+              onClick={() => handleOpenEditPoolMatch(match, poolName)}
+              className="px-2.5 py-1 rounded-lg bg-[#006A6A]/10 hover:bg-[#006A6A] text-[#006A6A] hover:text-white text-xs font-bold transition-colors cursor-pointer flex items-center gap-1"
+            >
+              <Edit3 className="w-3.5 h-3.5" />
+              <span>Edit Skor & Detail</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Teams and Quick Winner Selectors */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+          {/* Team A Card */}
+          <div
+            className={`p-3 rounded-xl border transition-all ${
+              isWinnerA
+                ? 'bg-[#E6F4F2] border-[#006A6A]/50 text-[#004F4F]'
+                : 'bg-[#F6FAF9] border-[#D8DFDE] text-[#475569]'
+            }`}
+          >
+            <div className="flex items-start justify-between gap-1">
+              <div className="min-w-0">
+                <div className="font-bold text-sm text-[#191C1C] truncate">
+                  {match.teamA || 'Tim 1 (Belum Diisi)'}
+                </div>
+                <div className="text-[11px] text-[#6F7978] truncate">
+                  {match.playersA || '-'}
+                </div>
+              </div>
+              <div className="text-right shrink-0">
+                <span className="font-mono text-base font-black text-[#006A6A] block">
+                  {match.scoreA}
+                </span>
+              </div>
+            </div>
+
+            <div className="mt-2 pt-2 border-t border-black/5 flex items-center justify-between">
+              <span className="text-[10px] font-mono font-semibold uppercase">
+                {isWinnerA ? '🏆 PEMENANG RESMI' : 'Tim 1 (A)'}
+              </span>
+              <button
+                type="button"
+                onClick={() => handleTogglePoolWinnerInline(match, 'A')}
+                className={`text-[10px] font-bold px-2 py-0.5 rounded cursor-pointer transition-colors ${
+                  isWinnerA
+                    ? 'bg-[#006A6A] text-white'
+                    : 'bg-white border border-[#D8DFDE] hover:border-[#006A6A] text-[#191C1C]'
+                }`}
+              >
+                {isWinnerA ? '✓ Juara / Menang' : 'Pilih Pemenang'}
+              </button>
+            </div>
+          </div>
+
+          {/* Team B Card */}
+          <div
+            className={`p-3 rounded-xl border transition-all ${
+              isWinnerB
+                ? 'bg-[#E6F4F2] border-[#006A6A]/50 text-[#004F4F]'
+                : 'bg-[#F6FAF9] border-[#D8DFDE] text-[#475569]'
+            }`}
+          >
+            <div className="flex items-start justify-between gap-1">
+              <div className="min-w-0">
+                <div className="font-bold text-sm text-[#191C1C] truncate">
+                  {match.teamB || 'Tim 2 (Belum Diisi)'}
+                </div>
+                <div className="text-[11px] text-[#6F7978] truncate">
+                  {match.playersB || '-'}
+                </div>
+              </div>
+              <div className="text-right shrink-0">
+                <span className="font-mono text-base font-black text-[#006A6A] block">
+                  {match.scoreB}
+                </span>
+              </div>
+            </div>
+
+            <div className="mt-2 pt-2 border-t border-black/5 flex items-center justify-between">
+              <span className="text-[10px] font-mono font-semibold uppercase">
+                {isWinnerB ? '🏆 PEMENANG RESMI' : 'Tim 2 (B)'}
+              </span>
+              <button
+                type="button"
+                onClick={() => handleTogglePoolWinnerInline(match, 'B')}
+                className={`text-[10px] font-bold px-2 py-0.5 rounded cursor-pointer transition-colors ${
+                  isWinnerB
+                    ? 'bg-[#006A6A] text-white'
+                    : 'bg-white border border-[#D8DFDE] hover:border-[#006A6A] text-[#191C1C]'
+                }`}
+              >
+                {isWinnerB ? '✓ Juara / Menang' : 'Pilih Pemenang'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
   };
 
   // Helper render for quick match item card
@@ -538,11 +1008,92 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
               onChange={(e) => setSelectedTournament(e.target.value)}
               className="w-full px-3 py-2.5 rounded-xl border border-[#D8DFDE] bg-[#F6FAF9] text-[#191C1C] font-semibold text-xs focus:outline-none focus:border-[#006A6A]"
             >
-              <option value="rookie-mix">LagiLagiPadel Rookie Fix Mix (Kemang)</option>
-              <option value="padelpro-open">Jakarta Padel Pro Open 2026 (Satrio)</option>
-              <option value="beginner-cup">Kemang Weekend Beginner Cup</option>
-              <option value="jak-masters">Jakarta Masters Invitational</option>
+              {tournaments.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name} ({t.location}) · [{t.status}]
+                </option>
+              ))}
             </select>
+
+            {/* Current Knockout Format Badge & Quick Switcher */}
+            <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 text-xs bg-[#F6FAF9] border border-[#D8DFDE] p-2 rounded-xl">
+              <div className="flex items-center gap-1.5">
+                <span className="text-[#6F7978] font-mono text-[10px] font-bold uppercase">Format:</span>
+                <span className="px-2 py-0.5 rounded-md font-bold text-[11px] bg-white border border-[#D8DFDE] text-[#006A6A] shadow-2xs flex items-center gap-1">
+                  {(!bracketData.roundOf16 || bracketData.roundOf16.length === 0) &&
+                  (!bracketData.quarters || bracketData.quarters.length === 0) &&
+                  (!bracketData.semis || bracketData.semis.length === 0) ? (
+                    <>
+                      <Crown className="w-3 h-3 text-amber-600" />
+                      <span>Langsung Grand Final (Juara Pool)</span>
+                    </>
+                  ) : (!bracketData.roundOf16 || bracketData.roundOf16.length === 0) &&
+                      (!bracketData.quarters || bracketData.quarters.length === 0) &&
+                      bracketData.semis && bracketData.semis.length > 0 ? (
+                    <>
+                      <Flame className="w-3 h-3 text-purple-600" />
+                      <span>Semifinal & Final</span>
+                    </>
+                  ) : bracketData.quarters && bracketData.quarters.length > 0 &&
+                      (!bracketData.roundOf16 || bracketData.roundOf16.length === 0) ? (
+                    <>
+                      <Zap className="w-3 h-3 text-blue-600" />
+                      <span>Perempat Final & Final</span>
+                    </>
+                  ) : (
+                    <>
+                      <Zap className="w-3 h-3 text-purple-600" />
+                      <span>16 Besar (Round of 16)</span>
+                    </>
+                  )}
+                </span>
+              </div>
+
+              {/* Quick Format Switcher Buttons */}
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => handleSwitchKnockoutStage('final')}
+                  className={`px-2 py-0.5 rounded-md text-[10px] font-bold border transition-all cursor-pointer ${
+                    (!bracketData.roundOf16 || bracketData.roundOf16.length === 0) &&
+                    (!bracketData.quarters || bracketData.quarters.length === 0) &&
+                    (!bracketData.semis || bracketData.semis.length === 0)
+                      ? 'bg-[#006A6A] text-white border-[#006A6A]'
+                      : 'bg-white text-[#3D5A57] border-[#D8DFDE] hover:border-[#006A6A]'
+                  }`}
+                  title="Pemenang pool langsung bertanding di Grand Final tanpa Semifinal & Perempat Final"
+                >
+                  Direct Final
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSwitchKnockoutStage('semis')}
+                  className={`px-2 py-0.5 rounded-md text-[10px] font-bold border transition-all cursor-pointer ${
+                    (!bracketData.roundOf16 || bracketData.roundOf16.length === 0) &&
+                    (!bracketData.quarters || bracketData.quarters.length === 0) &&
+                    bracketData.semis && bracketData.semis.length > 0
+                      ? 'bg-[#006A6A] text-white border-[#006A6A]'
+                      : 'bg-white text-[#3D5A57] border-[#D8DFDE] hover:border-[#006A6A]'
+                  }`}
+                  title="4 Tim bertanding di babak Semifinal & Grand Final"
+                >
+                  Semifinal
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSwitchKnockoutStage('quarters')}
+                  className={`px-2 py-0.5 rounded-md text-[10px] font-bold border transition-all cursor-pointer ${
+                    bracketData.quarters && bracketData.quarters.length > 0 &&
+                    (!bracketData.roundOf16 || bracketData.roundOf16.length === 0)
+                      ? 'bg-[#006A6A] text-white border-[#006A6A]'
+                      : 'bg-white text-[#3D5A57] border-[#D8DFDE] hover:border-[#006A6A]'
+                  }`}
+                  title="8 Tim bertanding di babak Perempat Final (QF)"
+                >
+                  Perempat Final
+                </button>
+              </div>
+            </div>
           </div>
 
           <div>
@@ -553,7 +1104,7 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
               <button
                 type="button"
                 onClick={() => setActiveRoundTab('all')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer ${
+                className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap ${
                   activeRoundTab === 'all'
                     ? 'bg-[#006A6A] text-white shadow-xs'
                     : 'bg-[#F6FAF9] text-[#3D5A57] border border-[#D8DFDE] hover:border-[#006A6A]'
@@ -561,39 +1112,65 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
               >
                 Semua
               </button>
-              <button
-                type="button"
-                onClick={() => setActiveRoundTab('roundOf16')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap ${
-                  activeRoundTab === 'roundOf16'
-                    ? 'bg-[#006A6A] text-white shadow-xs'
-                    : 'bg-[#F6FAF9] text-[#3D5A57] border border-[#D8DFDE] hover:border-[#006A6A]'
-                }`}
-              >
-                Round of 16 (8)
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveRoundTab('quarters')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap ${
-                  activeRoundTab === 'quarters'
-                    ? 'bg-[#006A6A] text-white shadow-xs'
-                    : 'bg-[#F6FAF9] text-[#3D5A57] border border-[#D8DFDE] hover:border-[#006A6A]'
-                }`}
-              >
-                Perempat Final (4)
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveRoundTab('semis')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap ${
-                  activeRoundTab === 'semis'
-                    ? 'bg-[#006A6A] text-white shadow-xs'
-                    : 'bg-[#F6FAF9] text-[#3D5A57] border border-[#D8DFDE] hover:border-[#006A6A]'
-                }`}
-              >
-                Semifinal (2)
-              </button>
+
+              {/* Dynamic Pool Stage Buttons */}
+              {tournamentPools.map((pName) => {
+                const count = poolMatches.filter((m) => m.round.includes(pName) || m.round.toLowerCase().includes(pName.toLowerCase())).length;
+                return (
+                  <button
+                    key={pName}
+                    type="button"
+                    onClick={() => setActiveRoundTab(`pool:${pName}`)}
+                    className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap ${
+                      activeRoundTab === `pool:${pName}`
+                        ? 'bg-[#006A6A] text-white shadow-xs'
+                        : 'bg-[#F6FAF9] text-[#3D5A57] border border-[#D8DFDE] hover:border-[#006A6A]'
+                    }`}
+                  >
+                    {pName} {count > 0 && `(${count})`}
+                  </button>
+                );
+              })}
+
+              {bracketData.roundOf16 && bracketData.roundOf16.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setActiveRoundTab('roundOf16')}
+                  className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap ${
+                    activeRoundTab === 'roundOf16'
+                      ? 'bg-[#006A6A] text-white shadow-xs'
+                      : 'bg-[#F6FAF9] text-[#3D5A57] border border-[#D8DFDE] hover:border-[#006A6A]'
+                  }`}
+                >
+                  Round of 16 ({bracketData.roundOf16.length})
+                </button>
+              )}
+              {bracketData.quarters && bracketData.quarters.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setActiveRoundTab('quarters')}
+                  className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap ${
+                    activeRoundTab === 'quarters'
+                      ? 'bg-[#006A6A] text-white shadow-xs'
+                      : 'bg-[#F6FAF9] text-[#3D5A57] border border-[#D8DFDE] hover:border-[#006A6A]'
+                  }`}
+                >
+                  Perempat Final ({bracketData.quarters.length})
+                </button>
+              )}
+              {bracketData.semis && bracketData.semis.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setActiveRoundTab('semis')}
+                  className={`px-3 py-1.5 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap ${
+                    activeRoundTab === 'semis'
+                      ? 'bg-[#006A6A] text-white shadow-xs'
+                      : 'bg-[#F6FAF9] text-[#3D5A57] border border-[#D8DFDE] hover:border-[#006A6A]'
+                  }`}
+                >
+                  Semifinal ({bracketData.semis.length})
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setActiveRoundTab('finals')}
@@ -603,7 +1180,7 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
                     : 'bg-[#F6FAF9] text-[#3D5A57] border border-[#D8DFDE] hover:border-[#006A6A]'
                 }`}
               >
-                Final & Juara 3 (2)
+                {bracketData.bronzeMatch ? 'Final & Juara 3 (2)' : 'Grand Final (1)'}
               </button>
             </div>
           </div>
@@ -612,36 +1189,77 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
 
       {/* List of Match Cards for Super Admin to Edit */}
       <div className="space-y-6">
+        {/* POOL STAGE MATCHES SECTION */}
+        {tournamentPools.map((pName) => {
+          const matchesInPool = poolMatches.filter(
+            (m) => m.round.includes(pName) || m.round.toLowerCase().includes(pName.toLowerCase())
+          );
+          const isPoolActive = activeRoundTab === 'all' || activeRoundTab === `pool:${pName}`;
+          if (!isPoolActive) return null;
+
+          const finishedCount = matchesInPool.filter((m) => m.status === 'Selesai').length;
+          const scheduledCount = matchesInPool.filter((m) => m.status === 'Dijadwalkan').length;
+          const liveCount = matchesInPool.filter((m) => m.status === 'Live').length;
+
+          return (
+            <div key={pName} className="space-y-3">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <h4 className="text-sm font-bold text-[#006A6A] flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-[#006A6A]" />
+                  <span>Babak Penyisihan Grup — {pName} ({matchesInPool.length} Pertandingan)</span>
+                </h4>
+                <div className="flex items-center gap-2 text-xs font-mono">
+                  {finishedCount > 0 && (
+                    <span className="px-2.5 py-0.5 rounded-md bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
+                      ✓ {finishedCount} Selesai (Terlaksana)
+                    </span>
+                  )}
+                  {scheduledCount > 0 && (
+                    <span className="px-2.5 py-0.5 rounded-md bg-neutral-100 text-neutral-600 font-bold border border-neutral-200">
+                      🕒 {scheduledCount} Dijadwalkan
+                    </span>
+                  )}
+                  {liveCount > 0 && (
+                    <span className="px-2.5 py-0.5 rounded-md bg-red-50 text-red-600 font-bold border border-red-200 animate-pulse">
+                      ● {liveCount} Live
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {matchesInPool.length === 0 ? (
+                <div className="p-6 text-center rounded-2xl bg-white border border-[#D8DFDE] text-xs text-[#6F7978]">
+                  Belum ada pertandingan untuk {pName}. Jadwal pertandingan akan dibuat otomatis dari pasangan peserta pool.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {matchesInPool.map((m) => renderPoolMatchRow(m, pName))}
+                </div>
+              )}
+            </div>
+          );
+        })}
         {/* ROUND OF 16 SECTION */}
-        {(activeRoundTab === 'all' || activeRoundTab === 'roundOf16') && (
+        {bracketData.roundOf16 && bracketData.roundOf16.length > 0 && (activeRoundTab === 'all' || activeRoundTab === 'roundOf16') && (
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <h4 className="text-sm font-bold text-[#191C1C] flex items-center gap-2">
                 <span className="w-2.5 h-2.5 rounded-full bg-[#006A6A]" />
-                <span>Round of 16 (Babak 16 Besar - 8 Pertandingan)</span>
+                <span>Round of 16 (Babak 16 Besar - {bracketData.roundOf16.length} Pertandingan)</span>
               </h4>
               <span className="text-xs text-[#6F7978] font-mono">
-                {bracketData.roundOf16?.length || 8} Pertandingan
+                {bracketData.roundOf16.length} Pertandingan
               </span>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {bracketData.roundOf16 && bracketData.roundOf16.length === 8
-                ? bracketData.roundOf16.map((m, idx) => renderMatchRow(m, 'roundOf16', idx))
-                : [0, 1, 2, 3, 4, 5, 6, 7].map((idx) => (
-                    <div
-                      key={idx}
-                      className="p-4 rounded-2xl bg-neutral-50 border border-neutral-200 text-xs text-neutral-500"
-                    >
-                      Pertandingan #{idx + 1} belum terkonfigurasi.
-                    </div>
-                  ))}
+              {bracketData.roundOf16.map((m, idx) => renderMatchRow(m, 'roundOf16', idx))}
             </div>
           </div>
         )}
 
         {/* QUARTER FINALS SECTION */}
-        {(activeRoundTab === 'all' || activeRoundTab === 'quarters') && (
+        {bracketData.quarters && bracketData.quarters.length > 0 && (activeRoundTab === 'all' || activeRoundTab === 'quarters') && (
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <h4 className="text-sm font-bold text-[#191C1C] flex items-center gap-2">
@@ -660,12 +1278,12 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
         )}
 
         {/* SEMI FINALS SECTION */}
-        {(activeRoundTab === 'all' || activeRoundTab === 'semis') && (
+        {bracketData.semis && bracketData.semis.length > 0 && (activeRoundTab === 'all' || activeRoundTab === 'semis') && (
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <h4 className="text-sm font-bold text-[#6E4D8B] flex items-center gap-2">
                 <Flame className="w-4 h-4 text-[#6E4D8B]" />
-                <span>Semi Finals (Semifinal - 2 Pertandingan)</span>
+                <span>Semi Finals (Semifinal - {bracketData.semis.length} Pertandingan)</span>
               </h4>
               <span className="text-xs text-[#6F7978] font-mono">
                 {bracketData.semis.length} Pertandingan
@@ -684,7 +1302,7 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
             <div className="flex items-center justify-between">
               <h4 className="text-sm font-bold text-[#854D0E] flex items-center gap-2">
                 <Crown className="w-4 h-4 text-amber-600" />
-                <span>Puncak Penentuan: Grand Final & Perebutan Juara 3</span>
+                <span>Puncak Penentuan: Grand Final {bracketData.bronzeMatch ? '& Perebutan Juara 3' : ''}</span>
               </h4>
             </div>
 
@@ -702,7 +1320,7 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
           <div className="space-y-0.5">
             <h4 className="text-base font-black text-[#191C1C] flex items-center gap-2 font-display">
               <Eye className="w-4 h-4 text-[#006A6A]" />
-              <span>Preview Visual Bagan Sistem Gugur (Warna Tema Resmi)</span>
+              <span>Preview Visual Bagan Sistem Gugur</span>
             </h4>
             <p className="text-xs text-[#6F7978]">
               Inilah tampilan yang akan langsung dilihat oleh pengunjung turnamen di halaman tamu.
@@ -711,7 +1329,7 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
           </div>
 
           <span className="text-xs font-mono text-[#006A6A] bg-[#E6F4F2] px-3 py-1 rounded-lg font-bold border border-[#006A6A]/20">
-            Interactive Admin Click-to-Edit
+            Klik untuk mengedit
           </span>
         </div>
 
@@ -722,7 +1340,7 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
           semis={bracketData.semis}
           grandFinal={bracketData.grandFinal}
           bronzeMatch={bracketData.bronzeMatch}
-          tournamentName={PADEL_TOURNAMENTS_DATA[selectedTournament]?.name}
+          tournamentName={tournaments.find((t) => t.id === selectedTournament)?.name || 'Turnamen Padel'}
           isAdminMode={true}
           onEditMatch={(m, rType) => {
             // Find index if array
@@ -834,178 +1452,319 @@ export const SuperAdminBracketManager: React.FC<SuperAdminBracketManagerProps> =
             </div>
 
             {/* Team 1 Details */}
-            <div className="p-4 rounded-2xl bg-[#F6FAF9] border border-[#D8DFDE] space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-mono font-bold text-[#006A6A] uppercase">
-                  Data Tim 1 (Atas):
-                </span>
-                <label className="flex items-center gap-1.5 text-xs font-bold text-[#191C1C] cursor-pointer">
-                  <input
-                    type="radio"
-                    name="winner_radio"
-                    checked={editingMatch.match.team1.isWinner}
-                    onChange={() =>
-                      setEditingMatch({
-                        ...editingMatch,
-                        match: {
-                          ...editingMatch.match,
-                          team1: { ...editingMatch.match.team1, isWinner: true },
-                          team2: { ...editingMatch.match.team2, isWinner: false },
-                          status: 'Selesai'
+            {/* Team 1 Details */}
+            {(() => {
+              const dropdown1 = getParticipantDropdownGroups(1);
+              return (
+                <div className="p-4 rounded-2xl bg-[#F6FAF9] border border-[#D8DFDE] space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-mono font-bold text-[#006A6A] uppercase">
+                      Data Tim 1 (Atas):
+                    </span>
+                    <label className="flex items-center gap-1.5 text-xs font-bold text-[#191C1C] cursor-pointer">
+                      <input
+                        type="radio"
+                        name="winner_radio"
+                        checked={editingMatch.match.team1.isWinner}
+                        onChange={() =>
+                          setEditingMatch({
+                            ...editingMatch,
+                            match: {
+                              ...editingMatch.match,
+                              team1: { ...editingMatch.match.team1, isWinner: true },
+                              team2: { ...editingMatch.match.team2, isWinner: false },
+                              status: 'Selesai'
+                            }
+                          })
                         }
-                      })
-                    }
-                    className="w-4 h-4 text-[#006A6A]"
-                  />
-                  <span>Pemenang (Winner)</span>
-                </label>
-              </div>
+                        className="w-4 h-4 text-[#006A6A]"
+                      />
+                      <span>Pemenang (Winner)</span>
+                    </label>
+                  </div>
 
-              <div className="grid grid-cols-3 gap-2 text-xs">
-                <div className="col-span-2">
-                  <label className="block text-[#6F7978] text-[10px] mb-1">Nama Pasangan Tim:</label>
-                  <input
-                    type="text"
-                    value={editingMatch.match.team1.name}
-                    onChange={(e) =>
-                      setEditingMatch({
-                        ...editingMatch,
-                        match: {
-                          ...editingMatch.match,
-                          team1: { ...editingMatch.match.team1, name: e.target.value }
-                        }
-                      })
-                    }
-                    placeholder="Contoh: Merry & Fifi"
-                    className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white font-bold"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[#6F7978] text-[10px] mb-1">Skor:</label>
-                  <input
-                    type="text"
-                    value={editingMatch.match.team1.score}
-                    onChange={(e) =>
-                      setEditingMatch({
-                        ...editingMatch,
-                        match: {
-                          ...editingMatch.match,
-                          team1: { ...editingMatch.match.team1, score: e.target.value }
-                        }
-                      })
-                    }
-                    placeholder="4"
-                    className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white font-mono font-black text-center text-sm"
-                  />
-                </div>
-              </div>
+                  {/* Dropdown Pemilihan Pasangan Tim 1 */}
+                  <div>
+                    <label className="block text-[#006A6A] font-mono text-[10px] uppercase font-bold mb-1 flex items-center justify-between">
+                      <span>Pilih Pasangan dari Pool / Peserta:</span>
+                      <span className="text-[9px] font-normal text-[#6F7978] lowercase">(klik untuk pilih instan)</span>
+                    </label>
+                    <select
+                      defaultValue=""
+                      onChange={(e) => {
+                        if (!e.target.value) return;
+                        try {
+                          const item = JSON.parse(e.target.value);
+                          setEditingMatch({
+                            ...editingMatch,
+                            match: {
+                              ...editingMatch.match,
+                              team1: {
+                                ...editingMatch.match.team1,
+                                name: item.name,
+                                players: item.players || 'TBD'
+                              }
+                            }
+                          });
+                        } catch (err) {}
+                      }}
+                      className="w-full px-2.5 py-2 rounded-xl border border-[#006A6A]/30 bg-white font-semibold text-xs text-[#191C1C] focus:outline-none focus:border-[#006A6A] focus:ring-1 focus:ring-[#006A6A] shadow-2xs"
+                    >
+                      <option value="">-- Pilih dari Daftar Pasangan Peserta / Babak --</option>
+                      {dropdown1.recommendations.length > 0 && (
+                        <optgroup label="⭐ Rekomendasi Sesuai Babak & Pool Ini">
+                          {dropdown1.recommendations.map((r, idx) => (
+                            <option key={`rec1-${idx}`} value={JSON.stringify({ name: r.name, players: r.players })}>
+                              {r.label}
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {dropdown1.knockoutWinners.length > 0 && (
+                        <optgroup label="🏆 Pemenang Babak Knockout Sebelumnya">
+                          {dropdown1.knockoutWinners.map((w, idx) => (
+                            <option key={`w1-${idx}`} value={JSON.stringify({ name: w.name, players: w.players })}>
+                              {w.label}
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {dropdown1.poolGroups.map((pg) => (
+                        <optgroup key={`pg1-${pg.poolName}`} label={`🏸 Pasangan Peserta ${pg.poolName} (${pg.teams.length} Tim)`}>
+                          {pg.teams.map((t, idx) => (
+                            <option key={`t1-${pg.poolName}-${idx}`} value={JSON.stringify({ name: t.name, players: t.players })}>
+                              {t.name} ({pg.poolName} {t.seed ? `· Seed ${t.seed}` : ''})
+                            </option>
+                          ))}
+                        </optgroup>
+                      ))}
+                      <optgroup label="📝 Format Standar / Placeholder">
+                        {dropdown1.placeholders.map((p, idx) => (
+                          <option key={`pl1-${idx}`} value={JSON.stringify({ name: p.name, players: p.players })}>
+                            {p.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    </select>
+                  </div>
 
-              <div>
-                <label className="block text-[#6F7978] text-[10px] mb-1">Nama Pemain Detail:</label>
-                <input
-                  type="text"
-                  value={editingMatch.match.team1.players}
-                  onChange={(e) =>
-                    setEditingMatch({
-                      ...editingMatch,
-                      match: {
-                        ...editingMatch.match,
-                        team1: { ...editingMatch.match.team1, players: e.target.value }
+                  <div className="grid grid-cols-3 gap-2 text-xs">
+                    <div className="col-span-2">
+                      <label className="block text-[#6F7978] text-[10px] mb-1">Nama Pasangan Tim:</label>
+                      <input
+                        type="text"
+                        value={editingMatch.match.team1.name}
+                        onChange={(e) =>
+                          setEditingMatch({
+                            ...editingMatch,
+                            match: {
+                              ...editingMatch.match,
+                              team1: { ...editingMatch.match.team1, name: e.target.value }
+                            }
+                          })
+                        }
+                        placeholder="Contoh: Merry & Fifi"
+                        className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white font-bold"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[#6F7978] text-[10px] mb-1">Skor:</label>
+                      <input
+                        type="text"
+                        value={editingMatch.match.team1.score}
+                        onChange={(e) =>
+                          setEditingMatch({
+                            ...editingMatch,
+                            match: {
+                              ...editingMatch.match,
+                              team1: { ...editingMatch.match.team1, score: e.target.value }
+                            }
+                          })
+                        }
+                        placeholder="4"
+                        className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white font-mono font-black text-center text-sm"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[#6F7978] text-[10px] mb-1">Nama Pemain Detail:</label>
+                    <input
+                      type="text"
+                      value={editingMatch.match.team1.players}
+                      onChange={(e) =>
+                        setEditingMatch({
+                          ...editingMatch,
+                          match: {
+                            ...editingMatch.match,
+                            team1: { ...editingMatch.match.team1, players: e.target.value }
+                          }
+                        })
                       }
-                    })
-                  }
-                  placeholder="Merry / Fifi"
-                  className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white text-xs"
-                />
-              </div>
-            </div>
+                      placeholder="Merry / Fifi"
+                      className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white text-xs"
+                    />
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* Team 2 Details */}
-            <div className="p-4 rounded-2xl bg-[#F6FAF9] border border-[#D8DFDE] space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-mono font-bold text-[#006A6A] uppercase">
-                  Data Tim 2 (Bawah):
-                </span>
-                <label className="flex items-center gap-1.5 text-xs font-bold text-[#191C1C] cursor-pointer">
-                  <input
-                    type="radio"
-                    name="winner_radio"
-                    checked={editingMatch.match.team2.isWinner}
-                    onChange={() =>
-                      setEditingMatch({
-                        ...editingMatch,
-                        match: {
-                          ...editingMatch.match,
-                          team1: { ...editingMatch.match.team1, isWinner: false },
-                          team2: { ...editingMatch.match.team2, isWinner: true },
-                          status: 'Selesai'
+            {(() => {
+              const dropdown2 = getParticipantDropdownGroups(2);
+              return (
+                <div className="p-4 rounded-2xl bg-[#F6FAF9] border border-[#D8DFDE] space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-mono font-bold text-[#006A6A] uppercase">
+                      Data Tim 2 (Bawah):
+                    </span>
+                    <label className="flex items-center gap-1.5 text-xs font-bold text-[#191C1C] cursor-pointer">
+                      <input
+                        type="radio"
+                        name="winner_radio"
+                        checked={editingMatch.match.team2.isWinner}
+                        onChange={() =>
+                          setEditingMatch({
+                            ...editingMatch,
+                            match: {
+                              ...editingMatch.match,
+                              team1: { ...editingMatch.match.team1, isWinner: false },
+                              team2: { ...editingMatch.match.team2, isWinner: true },
+                              status: 'Selesai'
+                            }
+                          })
                         }
-                      })
-                    }
-                    className="w-4 h-4 text-[#006A6A]"
-                  />
-                  <span>Pemenang (Winner)</span>
-                </label>
-              </div>
+                        className="w-4 h-4 text-[#006A6A]"
+                      />
+                      <span>Pemenang (Winner)</span>
+                    </label>
+                  </div>
 
-              <div className="grid grid-cols-3 gap-2 text-xs">
-                <div className="col-span-2">
-                  <label className="block text-[#6F7978] text-[10px] mb-1">Nama Pasangan Tim:</label>
-                  <input
-                    type="text"
-                    value={editingMatch.match.team2.name}
-                    onChange={(e) =>
-                      setEditingMatch({
-                        ...editingMatch,
-                        match: {
-                          ...editingMatch.match,
-                          team2: { ...editingMatch.match.team2, name: e.target.value }
-                        }
-                      })
-                    }
-                    placeholder="Contoh: Ari & Monaria"
-                    className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white font-bold"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[#6F7978] text-[10px] mb-1">Skor:</label>
-                  <input
-                    type="text"
-                    value={editingMatch.match.team2.score}
-                    onChange={(e) =>
-                      setEditingMatch({
-                        ...editingMatch,
-                        match: {
-                          ...editingMatch.match,
-                          team2: { ...editingMatch.match.team2, score: e.target.value }
-                        }
-                      })
-                    }
-                    placeholder="3"
-                    className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white font-mono font-black text-center text-sm"
-                  />
-                </div>
-              </div>
+                  {/* Dropdown Pemilihan Pasangan Tim 2 */}
+                  <div>
+                    <label className="block text-[#006A6A] font-mono text-[10px] uppercase font-bold mb-1 flex items-center justify-between">
+                      <span>Pilih Pasangan dari Pool / Peserta:</span>
+                      <span className="text-[9px] font-normal text-[#6F7978] lowercase">(klik untuk pilih instan)</span>
+                    </label>
+                    <select
+                      defaultValue=""
+                      onChange={(e) => {
+                        if (!e.target.value) return;
+                        try {
+                          const item = JSON.parse(e.target.value);
+                          setEditingMatch({
+                            ...editingMatch,
+                            match: {
+                              ...editingMatch.match,
+                              team2: {
+                                ...editingMatch.match.team2,
+                                name: item.name,
+                                players: item.players || 'TBD'
+                              }
+                            }
+                          });
+                        } catch (err) {}
+                      }}
+                      className="w-full px-2.5 py-2 rounded-xl border border-[#006A6A]/30 bg-white font-semibold text-xs text-[#191C1C] focus:outline-none focus:border-[#006A6A] focus:ring-1 focus:ring-[#006A6A] shadow-2xs"
+                    >
+                      <option value="">-- Pilih dari Daftar Pasangan Peserta / Babak --</option>
+                      {dropdown2.recommendations.length > 0 && (
+                        <optgroup label="⭐ Rekomendasi Sesuai Babak & Pool Ini">
+                          {dropdown2.recommendations.map((r, idx) => (
+                            <option key={`rec2-${idx}`} value={JSON.stringify({ name: r.name, players: r.players })}>
+                              {r.label}
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {dropdown2.knockoutWinners.length > 0 && (
+                        <optgroup label="🏆 Pemenang Babak Knockout Sebelumnya">
+                          {dropdown2.knockoutWinners.map((w, idx) => (
+                            <option key={`w2-${idx}`} value={JSON.stringify({ name: w.name, players: w.players })}>
+                              {w.label}
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {dropdown2.poolGroups.map((pg) => (
+                        <optgroup key={`pg2-${pg.poolName}`} label={`🏸 Pasangan Peserta ${pg.poolName} (${pg.teams.length} Tim)`}>
+                          {pg.teams.map((t, idx) => (
+                            <option key={`t2-${pg.poolName}-${idx}`} value={JSON.stringify({ name: t.name, players: t.players })}>
+                              {t.name} ({pg.poolName} {t.seed ? `· Seed ${t.seed}` : ''})
+                            </option>
+                          ))}
+                        </optgroup>
+                      ))}
+                      <optgroup label="📝 Format Standar / Placeholder">
+                        {dropdown2.placeholders.map((p, idx) => (
+                          <option key={`pl2-${idx}`} value={JSON.stringify({ name: p.name, players: p.players })}>
+                            {p.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    </select>
+                  </div>
 
-              <div>
-                <label className="block text-[#6F7978] text-[10px] mb-1">Nama Pemain Detail:</label>
-                <input
-                  type="text"
-                  value={editingMatch.match.team2.players}
-                  onChange={(e) =>
-                    setEditingMatch({
-                      ...editingMatch,
-                      match: {
-                        ...editingMatch.match,
-                        team2: { ...editingMatch.match.team2, players: e.target.value }
+                  <div className="grid grid-cols-3 gap-2 text-xs">
+                    <div className="col-span-2">
+                      <label className="block text-[#6F7978] text-[10px] mb-1">Nama Pasangan Tim:</label>
+                      <input
+                        type="text"
+                        value={editingMatch.match.team2.name}
+                        onChange={(e) =>
+                          setEditingMatch({
+                            ...editingMatch,
+                            match: {
+                              ...editingMatch.match,
+                              team2: { ...editingMatch.match.team2, name: e.target.value }
+                            }
+                          })
+                        }
+                        placeholder="Contoh: Ari & Monaria"
+                        className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white font-bold"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[#6F7978] text-[10px] mb-1">Skor:</label>
+                      <input
+                        type="text"
+                        value={editingMatch.match.team2.score}
+                        onChange={(e) =>
+                          setEditingMatch({
+                            ...editingMatch,
+                            match: {
+                              ...editingMatch.match,
+                              team2: { ...editingMatch.match.team2, score: e.target.value }
+                            }
+                          })
+                        }
+                        placeholder="3"
+                        className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white font-mono font-black text-center text-sm"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[#6F7978] text-[10px] mb-1">Nama Pemain Detail:</label>
+                    <input
+                      type="text"
+                      value={editingMatch.match.team2.players}
+                      onChange={(e) =>
+                        setEditingMatch({
+                          ...editingMatch,
+                          match: {
+                            ...editingMatch.match,
+                            team2: { ...editingMatch.match.team2, players: e.target.value }
+                          }
+                        })
                       }
-                    })
-                  }
-                  placeholder="Ari / Monaria"
-                  className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white text-xs"
-                />
-              </div>
-            </div>
+                      placeholder="Ari / Monaria"
+                      className="w-full px-3 py-1.5 rounded-xl border border-[#D8DFDE] bg-white text-xs"
+                    />
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* Modal Actions */}
             <div className="pt-2 flex items-center justify-end gap-2">

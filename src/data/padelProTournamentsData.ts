@@ -76,7 +76,7 @@ export interface FullTournamentDetail {
   organizer: string;
   location: string;
   date: string;
-  status: 'Live' | 'Selesai';
+  status: 'Live' | 'Selesai' | 'Akan Datang';
   categories: string[];
   totalCourts: number;
   rules: string;
@@ -84,6 +84,7 @@ export interface FullTournamentDetail {
   prizePool: string;
   description: string;
   liveCourtNumber?: number;
+  bannerUrl?: string; // 16:9 banner image path (e.g. /uploads/banner/3f9a...jpg)
 
   // 5 SUB-SECTIONS AS REQUESTED
   winners: {
@@ -214,154 +215,80 @@ export const PADEL_TOURNAMENTS_DATA: Record<string, FullTournamentDetail> = {
     ],
 
     knockoutBracket: {
-      roundOf16: [
-        {
-          id: 'r16-1',
-          roundTitle: 'Round of 16 #1',
-          court: 'COURT #1',
-          time: '18:36',
-          team1: { name: 'Merry & Fifi', players: 'Merry / Fifi', score: '4', isWinner: true },
-          team2: { name: 'Ari & Monaria', players: 'Ari / Monaria', score: '3', isWinner: false },
-          status: 'Selesai'
-        },
-        {
-          id: 'r16-2',
-          roundTitle: 'Round of 16 #2',
-          court: 'COURT #2',
-          time: '15:45',
-          team1: { name: 'Esty & Nova', players: 'Esty / Nova', score: '2', isWinner: false },
-          team2: { name: 'Gaby & Ichi', players: 'Gaby / Ichi', score: '4', isWinner: true },
-          status: 'Selesai'
-        },
-        {
-          id: 'r16-3',
-          roundTitle: 'Round of 16 #3',
-          court: 'COURT #3',
-          time: '11:19',
-          team1: { name: 'Gaia & Syla', players: 'Gaia / Syla', score: '4', isWinner: true },
-          team2: { name: 'Ch & Marcia', players: 'Ch / Marcia', score: '2', isWinner: false },
-          status: 'Selesai'
-        },
-        {
-          id: 'r16-4',
-          roundTitle: 'Round of 16 #4',
-          court: 'COURT #4',
-          time: '14:53',
-          team1: { name: 'Christina & Mega', players: 'Christina / Mega', score: '4', isWinner: true },
-          team2: { name: 'Meri Okta & Saralis', players: 'Meri Okta / Saralis', score: '2', isWinner: false },
-          status: 'Selesai'
-        },
-        {
-          id: 'r16-5',
-          roundTitle: 'Round of 16 #5',
-          court: 'COURT #1',
-          time: '09:58',
-          team1: { name: 'Clarina & Fang2', players: 'Clarina / Fang2', score: '1', isWinner: false },
-          team2: { name: 'Chaz & Iphz', players: 'Chaz / Iphz', score: '4', isWinner: true },
-          status: 'Selesai'
-        },
-        {
-          id: 'r16-6',
-          roundTitle: 'Round of 16 #6',
-          court: 'COURT #2',
-          time: '18:07',
-          team1: { name: 'Asih & Mama Eni', players: 'Asih / Mama Eni', score: '3', isWinner: false },
-          team2: { name: 'Frescha & Phe', players: 'Frescha / Phe', score: '4', isWinner: true },
-          status: 'Selesai'
-        },
-        {
-          id: 'r16-7',
-          roundTitle: 'Round of 16 #7',
-          court: 'COURT #3',
-          time: '11:32',
-          team1: { name: 'Maya & Sella', players: 'Maya / Sella', score: '3', isWinner: false },
-          team2: { name: 'Nia & Sassa Rizki', players: 'Nia / Sassa Rizki', score: '4', isWinner: true },
-          status: 'Selesai'
-        },
-        {
-          id: 'r16-8',
-          roundTitle: 'Round of 16 #8',
-          court: 'COURT #4',
-          time: '16:06',
-          team1: { name: 'La Maula & Tyas', players: 'La Maula / Tyas', score: '4', isWinner: true },
-          team2: { name: 'Riri & Gita', players: 'Riri / Gita', score: '2', isWinner: false },
-          status: 'Selesai'
-        }
-      ],
       quarters: [
         {
           id: 'qf-1',
-          roundTitle: 'Quarter Final 1',
-          court: 'COURT #1',
-          time: '06:24',
-          team1: { name: 'Merry & Fifi', players: 'Merry / Fifi', score: '4', isWinner: true },
-          team2: { name: 'Gaby & Ichi', players: 'Gaby / Ichi', score: '0', isWinner: false },
+          roundTitle: 'Perempat Final 1 (Juara Pool A vs Runner-up Pool B)',
+          court: 'Court 1',
+          time: '12:30 WIB',
+          team1: { name: 'Olivia & Rico', players: 'Olivia S. / Rico Prasetya', score: '4', isWinner: true },
+          team2: { name: 'Evan & Ngoe', players: 'Evan Wirawan / Ngoe Wijaya', score: '2', isWinner: false },
           status: 'Selesai'
         },
         {
           id: 'qf-2',
-          roundTitle: 'Quarter Final 2',
-          court: 'COURT #2',
-          time: '10:33',
-          team1: { name: 'Gaia & Syla', players: 'Gaia / Syla', score: '0', isWinner: false },
-          team2: { name: 'Christina & Mega', players: 'Christina / Mega', score: '4', isWinner: true },
+          roundTitle: 'Perempat Final 2 (Juara Pool B vs Runner-up Pool A)',
+          court: 'Court 2',
+          time: '12:30 WIB',
+          team1: { name: 'Kartika & Dodie Adam', players: 'Kartika / Dodie Adam', score: '4', isWinner: true },
+          team2: { name: 'Erde & Sie Jiang', players: 'Erde Pratama / Sie Jiang', score: '1', isWinner: false },
           status: 'Selesai'
         },
         {
           id: 'qf-3',
-          roundTitle: 'Quarter Final 3',
-          court: 'COURT #3',
-          time: '14:02',
-          team1: { name: 'Chaz & Iphz', players: 'Chaz / Iphz', score: '4', isWinner: true },
-          team2: { name: 'Frescha & Phe', players: 'Frescha / Phe', score: '2', isWinner: false },
+          roundTitle: 'Perempat Final 3 (Juara Pool C vs Runner-up Pool D)',
+          court: 'Court 3',
+          time: '13:15 WIB',
+          team1: { name: 'Tommy & David', players: 'Tommy Kurniawan / David Bayu', score: '4', isWinner: true },
+          team2: { name: 'Ardi & Gilang', players: 'Ardi Bakrie / Gilang Dirga', score: '2', isWinner: false },
           status: 'Selesai'
         },
         {
           id: 'qf-4',
-          roundTitle: 'Quarter Final 4',
-          court: 'COURT #4',
-          time: '16:06',
-          team1: { name: 'Nia & Sassa Rizki', players: 'Nia / Sassa Rizki', score: '4', isWinner: true },
-          team2: { name: 'La Maula & Tyas', players: 'La Maula / Tyas', score: '3', isWinner: false },
+          roundTitle: 'Perempat Final 4 (Juara Pool D vs Runner-up Pool C)',
+          court: 'Court 4',
+          time: '13:15 WIB',
+          team1: { name: 'Bagas & Dimas', players: 'Bagas Pratama / Dimas Wicaksono', score: '4', isWinner: true },
+          team2: { name: 'Rendy & Surya', players: 'Rendy Pandugo / Surya Insomnia', score: '1', isWinner: false },
           status: 'Selesai'
         }
       ],
       semis: [
         {
           id: 'sf-1',
-          roundTitle: 'Semi Final 1',
-          court: 'COURT #1',
-          time: '17:30',
-          team1: { name: 'Merry & Fifi', players: 'Merry / Fifi', score: '4', isWinner: true },
-          team2: { name: 'Christina & Mega', players: 'Christina / Mega', score: '3', isWinner: false },
+          roundTitle: 'Semifinal 1 (Pemenang QF 1 vs QF 3)',
+          court: 'Court 1',
+          time: '14:00 WIB',
+          team1: { name: 'Olivia & Rico', players: 'Olivia S. / Rico Prasetya', score: '6', isWinner: true },
+          team2: { name: 'Tommy & David', players: 'Tommy Kurniawan / David Bayu', score: '4', isWinner: false },
           status: 'Selesai'
         },
         {
           id: 'sf-2',
-          roundTitle: 'Semi Final 2',
-          court: 'COURT #2',
-          time: '10:31',
-          team1: { name: 'Chaz & Iphz', players: 'Chaz / Iphz', score: '2', isWinner: false },
-          team2: { name: 'Nia & Sassa Rizki', players: 'Nia / Sassa Rizki', score: '4', isWinner: true },
+          roundTitle: 'Semifinal 2 (Pemenang QF 2 vs QF 4)',
+          court: 'Court 2',
+          time: '14:00 WIB',
+          team1: { name: 'Kartika & Dodie Adam', players: 'Kartika / Dodie Adam', score: '6', isWinner: true },
+          team2: { name: 'Bagas & Dimas', players: 'Bagas Pratama / Dimas Wicaksono', score: '3', isWinner: false },
           status: 'Selesai'
         }
       ],
       grandFinal: {
         id: 'gf-1',
-        roundTitle: 'Grand Final (Juara 1 & 2)',
-        court: 'COURT #2',
-        time: '14:39',
-        team1: { name: 'Merry & Fifi', players: 'Merry / Fifi', score: '6', isWinner: true },
-        team2: { name: 'Nia & Sassa Rizki', players: 'Nia / Sassa Rizki', score: '1', isWinner: false },
-        status: 'Selesai'
+        roundTitle: 'Grand Final (Gold Match)',
+        court: 'Court 1',
+        time: '16:30 WIB',
+        team1: { name: 'Olivia & Rico', players: 'Olivia S. / Rico Prasetya', score: '6', isWinner: false },
+        team2: { name: 'Kartika & Dodie Adam', players: 'Kartika / Dodie Adam', score: '4', isWinner: false },
+        status: 'Live'
       },
       bronzeMatch: {
         id: 'bm-1',
-        roundTitle: 'Perebutan Juara 3',
-        court: 'COURT #1',
-        time: '20:28',
-        team1: { name: 'Christina & Mega', players: 'Christina / Mega', score: '6', isWinner: true },
-        team2: { name: 'Chaz & Iphz', players: 'Chaz / Iphz', score: '3', isWinner: false },
+        roundTitle: 'Perebutan Juara 3 (Bronze Match)',
+        court: 'Court 2',
+        time: '15:15 WIB',
+        team1: { name: 'Evan & Ngoe', players: 'Evan Wirawan / Ngoe Wijaya', score: '6', isWinner: true },
+        team2: { name: 'Bimo & Farhan', players: 'Bimo Prasetyo / Farhan Hakim', score: '3', isWinner: false },
         status: 'Selesai'
       }
     },

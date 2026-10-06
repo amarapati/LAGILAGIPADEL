@@ -1,6 +1,6 @@
 {
-  "name": "Remix LagiLagiPadel",
-  "description": "Platform resmi pemesanan lapangan padel WPT-grade, matchmaking komunitas, akademi pelatihan, turnamen, dan pro shop di Jakarta.",
+  "name": "LagiLagiPadel",
+  "description": "Platform resmi komunitas, pelatihan, dan turnamen Padel di Solo.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

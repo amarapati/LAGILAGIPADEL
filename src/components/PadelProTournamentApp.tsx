@@ -22,12 +22,20 @@ import {
   Clock,
   Filter,
   Maximize2,
-  Minimize2
+  Minimize2,
+  Plus,
+  Instagram
 } from 'lucide-react';
-import { PADEL_TOURNAMENTS_DATA, FullTournamentDetail } from '../data/padelProTournamentsData';
+import { ReclubIcon } from './ReclubIcon';
+import { FullTournamentDetail, TournamentParticipant, PoolTeamStanding } from '../data/padelProTournamentsData';
 import { RefereeAdminPortal } from './RefereeAdminPortal';
 import { KnockoutBracketVisualizer } from './KnockoutBracketVisualizer';
 import { getStoredBracket, KnockoutBracketData } from '../data/bracketStorage';
+import { getStoredTournaments, getOrGeneratePoolMatches } from '../data/tournamentStorage';
+import { lookupPlayerPhoto, lookupMemberByName, getStoredMembers, ClubMember } from '../data/clubMembersStorage';
+import { getStoredTournamentGroups, PoolGroupData } from '../data/tournamentGroupStorage';
+import { getStoredRefereeState, RefereeScoringState } from '../data/refereeStorage';
+import { startBackgroundSync, apiFetchGroups, apiFetchBracket } from '../data/apiClient';
 
 interface TeamData {
   id: string;
@@ -46,8 +54,6 @@ type TournamentSubTab = 'juara' | 'peserta' | 'hasil' | 'bracket' | 'klasemen';
 export const PadelProTournamentApp: React.FC = () => {
   // Guest view tabs (Tamu / Pengunjung hanya melihat Turnamen & Bagan serta Hall of Fame)
   const [activeTab, setActiveTab] = useState<'tournaments' | 'halloffame'>('tournaments');
-  const [selectedTournament, setSelectedTournament] = useState<string>('rookie-mix');
-  const [openedTournamentId, setOpenedTournamentId] = useState<string | null>(null);
 
   // Dedicated Admin / Referee Portal State
   const [showAdminPortal, setShowAdminPortal] = useState<boolean>(false);
@@ -144,108 +150,283 @@ export const PadelProTournamentApp: React.FC = () => {
   const [tournamentSubTab, setTournamentSubTab] = useState<TournamentSubTab>('juara');
   const [participantSearch, setParticipantSearch] = useState<string>('');
   const [poolFilter, setPoolFilter] = useState<string>('Semua Pool');
-  const [matchFilter, setMatchFilter] = useState<'semua' | 'grup' | 'knockout' | 'final'>('semua');
+  const [matchFilter, setMatchFilter] = useState<string>('semua');
 
-  // Active tournament detail data from dataset
-  const activeTourney: FullTournamentDetail =
-    PADEL_TOURNAMENTS_DATA[openedTournamentId || selectedTournament] || PADEL_TOURNAMENTS_DATA['rookie-mix'];
+  // Persistent & reactive Tournaments List (synchronized with Admin Tournament Manager)
+  const [storedTournaments, setStoredTournaments] = useState<FullTournamentDetail[]>(() =>
+    getStoredTournaments()
+  );
+  const [selectedTournament, setSelectedTournament] = useState<string>(() => {
+    const initial = getStoredTournaments();
+    return initial[0]?.id || 'rookie-mix';
+  });
+  const [openedTournamentId, setOpenedTournamentId] = useState<string | null>(null);
+  const [guestStatusFilter, setGuestStatusFilter] = useState<'semua' | 'Live' | 'Akan Datang' | 'Selesai'>('semua');
+
+  // Daftar turnamen yang berstatus 'Live' (sedang berlangsung)
+  const liveTournaments = React.useMemo(
+    () => storedTournaments.filter((t) => t.status === 'Live'),
+    [storedTournaments]
+  );
+
+  // Turnamen aktif yang sedang live untuk tampilan beranda
+  const [selectedLiveHomeId, setSelectedLiveHomeId] = useState<string>('');
+
+  const liveTourneyForHome: FullTournamentDetail | undefined = React.useMemo(() => {
+    if (liveTournaments.length === 0) return undefined;
+    return liveTournaments.find((t) => t.id === selectedLiveHomeId) || liveTournaments[0];
+  }, [liveTournaments, selectedLiveHomeId]);
+
+  // Active tournament detail data from dynamic storage:
+  // - Jika membuka detail turnamen (openedTournamentId terisi), tampilkan turnamen tersebut.
+  // - Jika di beranda utama (!openedTournamentId), gunakan turnamen live (jika ada).
+  const activeTourney: FullTournamentDetail | undefined = React.useMemo(() => {
+    if (openedTournamentId) {
+      return storedTournaments.find((t) => t.id === openedTournamentId);
+    }
+    return liveTourneyForHome;
+  }, [openedTournamentId, storedTournaments, liveTourneyForHome]);
 
   // Persistent & reactive Knockout Bracket (synchronized with Super Admin edits)
-  const currentTourneyId = openedTournamentId || selectedTournament || 'rookie-mix';
+  const currentTourneyId = activeTourney?.id || openedTournamentId || selectedTournament || '';
   const [liveKnockoutBracket, setLiveKnockoutBracket] = useState<KnockoutBracketData>(() =>
     getStoredBracket(currentTourneyId)
   );
 
+  // Persistent & reactive Club Members & Group Draws
+  const [liveClubMembers, setLiveClubMembers] = useState<ClubMember[]>(() => getStoredMembers());
+  const [liveGroupPools, setLiveGroupPools] = useState<PoolGroupData[]>(() =>
+    getStoredTournamentGroups(currentTourneyId)
+  );
+
   useEffect(() => {
-    setLiveKnockoutBracket(getStoredBracket(currentTourneyId));
+    const stopSync = startBackgroundSync(2500);
+    return () => {
+      stopSync();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (currentTourneyId) {
+      setLiveKnockoutBracket(getStoredBracket(currentTourneyId));
+      setLiveGroupPools(getStoredTournamentGroups(currentTourneyId));
+      apiFetchGroups(currentTourneyId)
+        .then((pools) => {
+          if (pools && pools.length > 0) setLiveGroupPools(pools);
+        })
+        .catch(() => {});
+      apiFetchBracket(currentTourneyId)
+        .then((b) => {
+          if (b) setLiveKnockoutBracket(b);
+        })
+        .catch(() => {});
+    }
   }, [currentTourneyId]);
 
   useEffect(() => {
     const handleBracketUpdated = (e: Event) => {
       const customEvent = e as CustomEvent;
-      if (customEvent.detail?.tournamentId === currentTourneyId) {
+      if (customEvent.detail?.tournamentId === currentTourneyId && customEvent.detail?.bracket) {
         setLiveKnockoutBracket(customEvent.detail.bracket);
+      } else {
+        setLiveKnockoutBracket(getStoredBracket(currentTourneyId));
       }
     };
+    const handleMembersUpdated = () => {
+      setLiveClubMembers(getStoredMembers());
+    };
+    const handleGroupsUpdated = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail?.tournamentId === currentTourneyId && customEvent.detail?.pools) {
+        setLiveGroupPools(customEvent.detail.pools);
+      } else {
+        setLiveGroupPools(getStoredTournamentGroups(currentTourneyId));
+      }
+      setStoredTournaments(getStoredTournaments());
+    };
+    const handleTournamentsUpdated = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail?.tournaments) {
+        setStoredTournaments(customEvent.detail.tournaments);
+      } else {
+        setStoredTournaments(getStoredTournaments());
+      }
+      setLiveGroupPools(getStoredTournamentGroups(currentTourneyId));
+    };
+    const handleRefereeStateChanged = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail?.state) {
+        setLiveReferee(customEvent.detail.state);
+      } else {
+        setLiveReferee(getStoredRefereeState());
+      }
+    };
+
     window.addEventListener('lagilagipadel_bracket_updated', handleBracketUpdated);
-    return () => window.removeEventListener('lagilagipadel_bracket_updated', handleBracketUpdated);
+    window.addEventListener('lagilagipadel_members_updated', handleMembersUpdated);
+    window.addEventListener('lagilagipadel_groups_updated', handleGroupsUpdated);
+    window.addEventListener('lagilagipadel_tournaments_updated', handleTournamentsUpdated);
+    window.addEventListener('lagilagipadel_referee_state_changed', handleRefereeStateChanged);
+    window.addEventListener('lagilagipadel_scoring_reset', handleRefereeStateChanged);
+    return () => {
+      window.removeEventListener('lagilagipadel_bracket_updated', handleBracketUpdated);
+      window.removeEventListener('lagilagipadel_members_updated', handleMembersUpdated);
+      window.removeEventListener('lagilagipadel_groups_updated', handleGroupsUpdated);
+      window.removeEventListener('lagilagipadel_tournaments_updated', handleTournamentsUpdated);
+      window.removeEventListener('lagilagipadel_referee_state_changed', handleRefereeStateChanged);
+      window.removeEventListener('lagilagipadel_scoring_reset', handleRefereeStateChanged);
+    };
   }, [currentTourneyId]);
+
+  // Reactive state for referee live electronic scoring
+  const [liveReferee, setLiveReferee] = useState<RefereeScoringState>(() => getStoredRefereeState());
+  const pointLabels = ['0', '15', '30', '40'];
 
   // Hall of fame search query
   const [playerSearchQuery, setPlayerSearchQuery] = useState('');
+  const [tournamentSearchQuery, setTournamentSearchQuery] = useState('');
 
-  // Real Tournaments Data
-  const tournamentsList = [
-    {
-      id: 'rookie-mix',
-      name: 'Rookie Fix Mix Motion x Winny Grosir',
-      organizer: 'Motion',
-      location: 'All In Padel',
-      date: '2026-09-06',
-      status: 'Live',
-      categories: ['Rookie Fix Mix (8 Pools, 32 Teams)'],
-      totalCourts: 4,
-      rules: 'Race to 4 Games · Golden Point Active · Auto Knockout Draw'
-    },
-    {
-      id: 'f3-rookie-men',
-      name: 'F3 Rookie Men vol 2',
-      organizer: 'F3',
-      location: 'Padeloka',
-      date: '2026-09-12',
-      status: 'Selesai',
-      categories: ['Rookie Men (12 Pools, 48 Teams)'],
-      totalCourts: 4,
-      rules: 'Total 4 Games · Golden Point'
-    },
-    {
-      id: 'hdmc-champions',
-      name: 'HDMC PADEL CHAMPIONS',
-      organizer: 'The Good Vibes Club',
-      location: 'ZING PADEL SOLO',
-      date: '2026-08-29',
-      status: 'Selesai',
-      categories: ['Rookie Men', 'Rookie Women', 'Low Bronze Mix', 'Veteran 40+'],
-      totalCourts: 6,
-      rules: 'Group Pools of 3 · Top 2 Qualify'
-    },
-    {
-      id: 'beginner-showdown',
-      name: 'Beginner Men Showdown',
-      organizer: 'Good Vibes Club',
-      location: 'Padeloka',
-      date: '2026-09-05',
-      status: 'Selesai',
-      categories: ['Man Beginner'],
-      totalCourts: 3,
-      rules: 'Pool 8 · Qualifiers 2 per pool'
+  // Filtered tournament list for guest view
+  const tournamentsList = storedTournaments.filter((item) => {
+    if (guestStatusFilter === 'semua') return true;
+    return item.status === guestStatusFilter;
+  });
+
+  // Reactive participants list: merges tournament participants with live pool allocation
+  const effectiveParticipants: TournamentParticipant[] = React.useMemo(() => {
+    const hasTeamsInPools = liveGroupPools && liveGroupPools.some((p) => p.teams && p.teams.length > 0);
+    if (hasTeamsInPools) {
+      const list: TournamentParticipant[] = [];
+      let seedCount = 1;
+      const prevStandings = activeTourney?.groupStandings?.standings || [];
+      const hasMatchesPlayed = (activeTourney?.matches?.length || 0) > 0;
+
+      liveGroupPools.forEach((pg) => {
+        pg.teams.forEach((t) => {
+          const mem1 = t.member1Id
+            ? liveClubMembers.find((m) => m.id === t.member1Id)
+            : lookupMemberByName(t.p1);
+          const mem2 = t.member2Id
+            ? liveClubMembers.find((m) => m.id === t.member2Id)
+            : lookupMemberByName(t.p2);
+
+          const existing = prevStandings.find((s) => s.id === t.id || s.name === t.name);
+          const isQual = hasMatchesPlayed && (existing?.played || 0) > 0 && Boolean(t.isQualified);
+
+          list.push({
+            seed: t.seed || seedCount++,
+            teamName: t.name,
+            p1: t.p1,
+            p2: t.p2,
+            category: activeTourney?.categories?.[0] || 'Ganda Umum',
+            club: t.club || mem1?.club || 'LagiLagi Padel',
+            city: mem1?.city || mem2?.city || 'Solo / Jakarta',
+            pool: pg.poolName,
+            rating: t.rating || '3.0',
+            status: isQual ? 'Playoff' : 'Confirmed'
+          });
+        });
+      });
+      return list;
     }
-  ];
+    return activeTourney?.participants || [];
+  }, [liveGroupPools, activeTourney, liveClubMembers]);
 
-  // Teams & Pool Table Data
-  const poolTeams: TeamData[] = [
-    { id: '1', name: 'Olivia & Rico', p1: 'Olivia', p2: 'Rico', pool: 'Pool A', won: 3, lost: 0, points: 6, gameDiff: +8 },
-    { id: '2', name: 'Erde & Sie Jiang', p1: 'Erde', p2: 'Sie Jiang', pool: 'Pool A', won: 2, lost: 1, points: 4, gameDiff: +3 },
-    { id: '3', name: 'Fery & Tania', p1: 'Fery', p2: 'Tania', pool: 'Pool A', won: 1, lost: 2, points: 2, gameDiff: -2 },
-    { id: '4', name: 'Hanung & Ria', p1: 'Hanung', p2: 'Ria', pool: 'Pool A', won: 0, lost: 3, points: 0, gameDiff: -9 },
-    { id: '5', name: 'Kartika & Dodie Adam', p1: 'Kartika Aditoputro', p2: 'Dodie Adam', pool: 'Pool B', won: 3, lost: 0, points: 6, gameDiff: +10 },
-    { id: '6', name: 'Evan & Ngoe', p1: 'Evan', p2: 'Ngoe', pool: 'Pool B', won: 2, lost: 1, points: 4, gameDiff: +4 },
-    { id: '7', name: 'Bimo & Farhan', p1: 'Bimo', p2: 'Farhan', pool: 'Pool B', won: 1, lost: 2, points: 2, gameDiff: -4 },
-    { id: '8', name: 'Reza & Kevin', p1: 'Reza', p2: 'Kevin', pool: 'Pool B', won: 0, lost: 3, points: 0, gameDiff: -10 }
-  ];
+  // Reactive group standings: merges active standings stats with live pool allocation
+  const effectiveGroupStandings = React.useMemo(() => {
+    const hasTeamsInPools = liveGroupPools && liveGroupPools.some((p) => p.teams && p.teams.length > 0);
+    if (hasTeamsInPools) {
+      const existingStandings = activeTourney?.groupStandings?.standings || [];
+      const poolNames = ['Semua Pool', ...liveGroupPools.map((p) => p.poolName)];
+      const standings: PoolTeamStanding[] = [];
 
-  // Hall of Fame Players
-  const hallOfFamePlayers = [
-    { name: 'KARTIKA ADITOPUTRO', partner: 'DODIE ADAM PRATAMA', gold: 2, silver: 1, bronze: 0, tournaments: ['F3 Rookie Men vol 2', 'HDMC Champions'] },
-    { name: 'Olivia S.', partner: 'Rico Prasetya', gold: 1, silver: 2, bronze: 1, tournaments: ['Rookie Fix Mix Motion', 'Beginner Showdown'] },
-    { name: 'Evan Wirawan', partner: 'Ngoe Wijaya', gold: 1, silver: 0, bronze: 2, tournaments: ['HDMC PADEL CHAMPIONS'] },
-    { name: 'Erde Pratama', partner: 'Sie Jiang', gold: 0, silver: 1, bronze: 1, tournaments: ['Rookie Fix Mix Motion'] }
-  ].filter((p) =>
-    playerSearchQuery === ''
-      ? true
-      : p.name.toLowerCase().includes(playerSearchQuery.toLowerCase()) ||
-        p.partner.toLowerCase().includes(playerSearchQuery.toLowerCase())
-  );
+      liveGroupPools.forEach((pg) => {
+        pg.teams.forEach((t, poolIdx) => {
+          const prev = existingStandings.find((s) => s.id === t.id || s.name === t.name);
+          standings.push({
+            id: t.id,
+            pos: poolIdx + 1,
+            name: t.name,
+            p1: t.p1,
+            p2: t.p2,
+            pool: pg.poolName,
+            played: prev?.played || 0,
+            won: prev?.won || 0,
+            lost: prev?.lost || 0,
+            gamesWon: prev?.gamesWon || 0,
+            gamesLost: prev?.gamesLost || 0,
+            gameDiff: prev?.gameDiff || 0,
+            points: prev?.points || 0,
+            isQualified: prev ? (prev.played > 0 && Boolean(prev.isQualified)) : Boolean(t.isQualified)
+          });
+        });
+      });
+
+      return {
+        pools: poolNames,
+        standings
+      };
+    }
+    return (
+      activeTourney?.groupStandings || {
+        pools: ['Semua Pool'],
+        standings: []
+      }
+    );
+  }, [liveGroupPools, activeTourney]);
+
+  // Teams & Pool Table Data dynamically derived from active tournament
+  const poolTeams: TeamData[] = React.useMemo(() => {
+    if (!effectiveGroupStandings || !effectiveGroupStandings.standings || effectiveGroupStandings.standings.length === 0) {
+      return [];
+    }
+    return effectiveGroupStandings.standings.map((st) => ({
+      id: st.id,
+      name: st.name,
+      p1: st.p1,
+      p2: st.p2,
+      pool: st.pool,
+      won: st.won,
+      lost: st.lost,
+      points: st.points,
+      gameDiff: st.gameDiff
+    }));
+  }, [effectiveGroupStandings]);
+
+  // Hall of Fame Players (Dynamically linked to Club Members system-wide)
+  const hallOfFamePlayers = liveClubMembers
+    .filter((m) => {
+      const hasAchievements =
+        (m.achievements?.gold || 0) > 0 ||
+        (m.achievements?.silver || 0) > 0 ||
+        (m.achievements?.bronze || 0) > 0 ||
+        m.isGroupQualified;
+      if (!hasAchievements) return false;
+
+      if (!playerSearchQuery.trim()) return true;
+      const q = playerSearchQuery.toLowerCase();
+      return (
+        m.name.toLowerCase().includes(q) ||
+        (m.nickname && m.nickname.toLowerCase().includes(q)) ||
+        m.id.toLowerCase().includes(q) ||
+        (m.achievements?.partnerDefault && m.achievements.partnerDefault.toLowerCase().includes(q)) ||
+        (m.city && m.city.toLowerCase().includes(q))
+      );
+    });
+
+  // Hall of Fame Tournaments with Podium Data
+  const finishedTournaments = storedTournaments.filter((t) => {
+    const hasPodium = t.winners?.podium && t.winners.podium.length > 0;
+    const isFinished = t.status === 'Selesai';
+    if (!hasPodium && !isFinished) return false;
+    if (!tournamentSearchQuery.trim()) return true;
+    const q = tournamentSearchQuery.toLowerCase();
+    return (
+      t.name.toLowerCase().includes(q) ||
+      t.organizer.toLowerCase().includes(q) ||
+      t.location.toLowerCase().includes(q)
+    );
+  });
 
   if (showAdminPortal) {
     return (
@@ -260,45 +441,37 @@ export const PadelProTournamentApp: React.FC = () => {
 
   return (
     <div className="bg-[#F6FAF9] text-[#191C1C] min-h-screen selection:bg-[#006A6A] selection:text-white">
-      {/* Sub-Header matching Material 3 theme */}
-      <div className="border-b border-[#D8DFDE] bg-white/95 backdrop-blur sticky top-16 z-30">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
-          <div className="flex items-center gap-3">
+      {/* Top Header matching Material 3 theme */}
+      <div className="border-b border-[#D8DFDE] bg-white/95 backdrop-blur-md sticky top-0 z-30 shadow-xs">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
+          <div
+            onClick={() => {
+              setActiveTab('tournaments');
+              setOpenedTournamentId(null);
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }}
+            className="flex items-center gap-3 cursor-pointer group"
+            title="Beranda LagiLagiPadel"
+          >
+            <img
+              src="https://lagilagipadel.id/cdn/logo-llp.png"
+              alt="LagiLagiPadel"
+              className="w-9 h-9 transition-transform group-hover:scale-105"
+            />
             <div className="flex flex-col leading-none">
-              <span className="text-lg font-black tracking-tight font-display text-[#191C1C]">
+              <span className="text-lg sm:text-xl font-black tracking-tight font-display text-[#191C1C]">
                 LagiLagi<span className="text-[#006A6A]">Padel</span>
               </span>
-              <span className="text-[9px] font-semibold text-[#6F7978] uppercase tracking-widest">
-                portal turnamen & hasil resmi
+              <span className="text-[10px] font-semibold text-[#6F7978] uppercase tracking-wider mt-0.5">
+                Portal Turnamen & Hasil
               </span>
             </div>
           </div>
 
-          {/* Guest Subnav Tabs (Tamu hanya melihat Turnamen & Bagan serta Hall of Fame) */}
-          <div className="flex items-center gap-1.5 sm:gap-2">
-            <button
-              onClick={() => setActiveTab('tournaments')}
-              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
-                activeTab === 'tournaments'
-                  ? 'bg-[#006A6A] text-white shadow-xs'
-                  : 'text-[#3D5A57] hover:text-[#191C1C] bg-white border border-[#D8DFDE]'
-              }`}
-            >
-              <Trophy className="w-3.5 h-3.5" />
-              <span>Turnamen & Bagan</span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('halloffame')}
-              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
-                activeTab === 'halloffame'
-                  ? 'bg-[#6E4D8B] text-white shadow-xs'
-                  : 'text-[#3D5A57] hover:text-[#191C1C] bg-white border border-[#D8DFDE]'
-              }`}
-            >
-              <Medal className="w-3.5 h-3.5" />
-              <span>Hall of Fame</span>
-            </button>
+          {/* Official Social Links: Instagram & Reclub */}
+          <div className="flex items-center gap-2 sm:gap-2.5">
+            {/* Instagram Official Community Button */}
+            
 
             {/* Tombol Terpisah Khusus Portal Wasit & Admin Pertandingan */}
             <button
@@ -306,12 +479,12 @@ export const PadelProTournamentApp: React.FC = () => {
                 setShowAdminPortal(true);
                 window.scrollTo({ top: 0, behavior: 'smooth' });
               }}
-              className="ml-2 sm:ml-4 px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 bg-[#191C1C] hover:bg-neutral-800 text-white shadow-xs border border-neutral-700"
+              className="ml-1 sm:ml-2 px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 bg-[#191C1C] hover:bg-neutral-800 text-white shadow-xs border border-neutral-700"
               title="Portal Khusus Wasit & Admin Pertandingan"
             >
               <ShieldCheck className="w-3.5 h-3.5 text-amber-300" />
               <span className="hidden sm:inline">Portal Wasit & Admin</span>
-              <span className="sm:hidden">Wasit</span>
+              <span className="sm:hidden">Admin</span>
             </button>
           </div>
         </div>
@@ -331,29 +504,137 @@ export const PadelProTournamentApp: React.FC = () => {
         </h1>
 
         <p className="text-sm sm:text-base text-[#3D5A57] font-medium max-w-xl mx-auto leading-relaxed">
-          Informasi Turnamen Resmi, Bagan Knockout, Jadwal & Klasemen Pool
+          Informasi Turnamen, Bagan Knockout, Jadwal & Klasemen Pool
         </p>
 
         <div className="flex items-center justify-center gap-3 pt-2">
-          <button
-            onClick={() => {
-              setActiveTab('tournaments');
-              setOpenedTournamentId(null);
-            }}
-            className="px-5 py-2.5 rounded-xl bg-[#006A6A] hover:bg-[#007A7C] text-white font-bold text-xs sm:text-sm shadow-md shadow-[#006A6A]/20 transition-all flex items-center gap-2 cursor-pointer"
+          <a
+            href="https://www.instagram.com/lagilagipadel.id"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="p-2 sm:px-3 sm:py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 text-[#3D5A57] hover:text-[#E1306C] hover:border-[#E1306C]/40 bg-white border border-[#D8DFDE] hover:bg-pink-50/50 shadow-2xs group"
+            title="Instagram @lagilagipadel.id"
+            aria-label="Instagram @lagilagipadel.id"
           >
-            <Trophy className="w-4 h-4 text-white" />
-            <span>Lihat Turnamen</span>
-          </button>
-          <button
-            onClick={() => setActiveTab('halloffame')}
-            className="px-5 py-2.5 rounded-xl bg-[#6E4D8B] hover:bg-[#8562A4] text-white font-bold text-xs sm:text-sm shadow-md shadow-[#6E4D8B]/20 transition-all flex items-center gap-2 cursor-pointer"
+            <Instagram className="w-4 h-4 text-[#E1306C] group-hover:scale-110 transition-transform shrink-0" />
+            <span className="sm:inline font-semibold text-[#191C1C] group-hover:text-[#E1306C] transition-colors">
+              @lagilagipadel.id
+            </span>
+          </a>
+
+          {/* Reclub Community Club Button */}
+          <a
+            href="https://reclub.co/clubs/@lagilagipadel.id"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="p-2 sm:px-3 sm:py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 text-[#3D5A57] hover:text-[#FF4A4A] hover:border-[#FF4A4A]/40 bg-white border border-[#D8DFDE] hover:bg-red-50/50 shadow-2xs group"
+            title="Reclub @lagilagipadel.id"
+            aria-label="Reclub @lagilagipadel.id"
           >
-            <Medal className="w-4 h-4 text-white" />
-            <span>Hall of Fame</span>
-          </button>
+            <ReclubIcon className="w-4 h-4 text-[#FF4A4A] group-hover:scale-110 transition-transform shrink-0" />
+            <span className="sm:inline font-semibold text-[#191C1C] group-hover:text-[#FF4A4A] transition-colors">
+              @lagilagipadel.id
+            </span>
+          </a>
         </div>
       </section>
+
+      {/* REAL-TIME LIVE SCORING BANNER FROM REFEREE */}
+      {liveReferee && !liveReferee.isCleared && (liveReferee.courtScoreA > 0 || liveReferee.courtScoreB > 0 || liveReferee.gamesTeamA > 0 || liveReferee.gamesTeamB > 0) && (
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 mb-8 animate-in slide-in-from-top-3 duration-300">
+          <div className="p-4 sm:p-5 rounded-3xl bg-gradient-to-r from-[#191C1C] via-[#05201E] to-[#191C1C] text-white border-2 border-red-500/40 shadow-xl relative overflow-hidden">
+            <div className="absolute top-0 right-0 transform translate-x-8 -translate-y-8 w-36 h-36 bg-red-600/10 rounded-full blur-2xl pointer-events-none" />
+
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 relative z-10">
+              {/* Header Badge */}
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-red-600 text-white text-[11px] font-black tracking-wider uppercase animate-pulse shadow-sm">
+                    <span className="w-2 h-2 rounded-full bg-white animate-ping" />
+                    LIVE SKOR WASIT
+                  </span>
+                  <span className="text-xs font-mono font-bold text-teal-300">
+                    Court #{liveReferee.activeCourt} · {liveReferee.matchPhase}
+                  </span>
+                  {liveReferee.goldenPointActive && (
+                    <span className="px-2 py-0.5 rounded-md bg-amber-500 text-black text-[10px] font-black uppercase animate-bounce">
+                      ⚡ Golden Point
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-neutral-300 font-mono">
+                  {storedTournaments.find((t) => t.id === liveReferee.selectedTourneyId)?.name || 'Pertandingan Sedang Berlangsung (Live)'}
+                </p>
+              </div>
+
+              {/* Live Match Scoreboard Matrix */}
+              <div className="flex items-center gap-3 sm:gap-6 bg-white/5 border border-white/10 p-3 sm:p-4 rounded-2xl flex-wrap justify-center">
+                {/* Team A */}
+                <div className="text-right min-w-[120px]">
+                  <div className="flex items-center justify-end gap-1.5">
+                    {liveReferee.currentServer === 'A' && (
+                      <span className="text-[10px] bg-teal-400 text-teal-950 font-bold px-1.5 py-0.2 rounded-md font-mono">
+                        SERVE
+                      </span>
+                    )}
+                    <span className="text-sm sm:text-base font-extrabold text-white truncate block">
+                      {liveReferee.teamAName}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-teal-200 font-mono mt-0.5">
+                    Set: <span className="font-bold text-white">{liveReferee.currentSetA}</span> · Games: <span className="font-bold text-white">{liveReferee.gamesTeamA}</span>
+                  </div>
+                </div>
+
+                {/* Score Big Display */}
+                <div className="px-3.5 sm:px-5 py-1.5 rounded-xl bg-black/60 border border-white/10 flex items-center gap-2 text-center shadow-inner">
+                  <span className="text-2xl sm:text-3xl font-black font-mono text-teal-300 tracking-wider">
+                    {pointLabels[liveReferee.courtScoreA] || '0'}
+                  </span>
+                  <span className="text-sm font-bold text-neutral-500">:</span>
+                  <span className="text-2xl sm:text-3xl font-black font-mono text-teal-300 tracking-wider">
+                    {pointLabels[liveReferee.courtScoreB] || '0'}
+                  </span>
+                </div>
+
+                {/* Team B */}
+                <div className="text-left min-w-[120px]">
+                  <div className="flex items-center justify-start gap-1.5">
+                    <span className="text-sm sm:text-base font-extrabold text-white truncate block">
+                      {liveReferee.teamBName}
+                    </span>
+                    {liveReferee.currentServer === 'B' && (
+                      <span className="text-[10px] bg-teal-400 text-teal-950 font-bold px-1.5 py-0.2 rounded-md font-mono">
+                        SERVE
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-teal-200 font-mono mt-0.5">
+                    Set: <span className="font-bold text-white">{liveReferee.currentSetB}</span> · Games: <span className="font-bold text-white">{liveReferee.gamesTeamB}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Quick View Button */}
+              <div className="shrink-0 self-start md:self-auto">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const targetTourney = liveReferee.selectedTourneyId || (storedTournaments[0] && storedTournaments[0].id) || 'rookie-mix';
+                    setOpenedTournamentId(targetTourney);
+                    setSelectedTournament(targetTourney);
+                    setTournamentSubTab('hasil');
+                  }}
+                  className="px-4 py-2 rounded-xl bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold transition-all shadow-md cursor-pointer flex items-center gap-1.5"
+                >
+                  <Activity className="w-3.5 h-3.5" />
+                  <span>Buka Hasil Pertandingan</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* TAB 1: TOURNAMENTS & BRACKETS */}
       {activeTab === 'tournaments' && (
@@ -363,275 +644,344 @@ export const PadelProTournamentApp: React.FC = () => {
             <div className="space-y-12 animate-in fade-in duration-200">
               {/* Tournament Cards Portfolio */}
               <div>
-                <div className="flex items-center justify-between mb-6">
-                  <h2 className="text-xl font-bold text-[#191C1C] flex items-center gap-2 font-display">
-                    <Trophy className="w-5 h-5 text-[#006A6A]" />
-                    <span>Daftar Turnamen Padel</span>
-                  </h2>
-                  <span className="text-xs text-[#6F7978] font-mono">
-                    {tournamentsList.length} Turnamen Terdaftar
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                  {tournamentsList.map((item) => (
-                    <div
-                      key={item.id}
-                      onClick={() => {
-                        setSelectedTournament(item.id);
-                        setOpenedTournamentId(item.id);
-                        setTournamentSubTab('juara');
-                        setPoolFilter('Semua Pool');
-                        setParticipantSearch('');
-                        setMatchFilter('semua');
-                        window.scrollTo({ top: 0, behavior: 'smooth' });
-                      }}
-                      className="p-5 rounded-2xl border border-[#D8DFDE] bg-white hover:border-[#006A6A] hover:shadow-md transition-all cursor-pointer shadow-xs group"
-                    >
-                      <div className="flex items-start justify-between gap-2 mb-2">
-                        <span className="text-xs font-mono text-[#006A6A] uppercase font-bold">
-                          {item.organizer}
-                        </span>
-                        <span
-                          className={`px-2.5 py-0.5 rounded-md text-[11px] font-bold ${
-                            item.status === 'Live'
-                              ? 'bg-[#BA1A1A] text-white animate-pulse'
-                              : 'bg-[#006A6A]/10 text-[#006A6A] border border-[#006A6A]/30'
-                          }`}
-                        >
-                          {item.status}
-                        </span>
-                      </div>
-
-                      <h3 className="text-base sm:text-lg font-bold text-[#191C1C] mb-2 font-display group-hover:text-[#006A6A] transition-colors">
-                        {item.name}
-                      </h3>
-
-                      <div className="space-y-1.5 text-xs text-[#3D5A57] mb-4">
-                        <div className="flex items-center gap-2">
-                          <MapPin className="w-3.5 h-3.5 text-[#006A6A]" />
-                          <span>{item.location} ({item.totalCourts} Courts)</span>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <Calendar className="w-3.5 h-3.5 text-[#6F7978]" />
-                          <span>{item.date}</span>
-                        </div>
-                        <div className="text-[11px] text-[#6F7978]">
-                          Format: {item.rules}
-                        </div>
-                      </div>
-
-                      <div className="flex items-center justify-between pt-3 border-t border-[#D8DFDE] text-xs">
-                        <span className="text-[#006A6A] font-semibold flex items-center gap-1 group-hover:underline">
-                          Klik untuk Buka Bagan & Pool
-                        </span>
-                        <ArrowRight className="w-3.5 h-3.5 text-[#6F7978] group-hover:text-[#006A6A] group-hover:translate-x-1 transition-all" />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* Interactive Pool Standings (Tampilan Default Halaman Awal) */}
-              <div
-                ref={standingsRef}
-                className={
-                  isStandingsFullscreen
-                    ? 'fixed inset-0 z-50 overflow-y-auto bg-[#F6FAF9] p-6 sm:p-10 space-y-6 shadow-2xl animate-in fade-in duration-200'
-                    : 'p-6 rounded-2xl bg-white border border-[#D8DFDE] space-y-6 shadow-xs'
-                }
-              >
-                {/* Full Screen Top Banner */}
-                {isStandingsFullscreen && (
-                  <div className="bg-[#191C1C] text-white px-4 sm:px-6 py-3 rounded-2xl flex items-center justify-between shadow-lg">
-                    <div className="flex items-center gap-2.5 text-xs">
-                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping" />
-                      <span className="font-mono font-bold tracking-wider uppercase text-emerald-300">
-                        Mode Layar Penuh: Klasemen Pool & Sistem Gugur
-                      </span>
-                      <span className="text-neutral-400 hidden sm:inline">
-                        · Tekan tombol [Esc] pada keyboard atau tombol merah untuk keluar
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={toggleStandingsFullscreen}
-                      className="px-3.5 py-1.5 rounded-xl bg-[#BA1A1A] hover:bg-red-700 text-white text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-md"
-                    >
-                      <Minimize2 className="w-3.5 h-3.5" />
-                      <span>Keluar Full Screen</span>
-                    </button>
-                  </div>
-                )}
-
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6">
                   <div>
-                    <h3 className="text-lg font-bold text-[#191C1C] flex items-center gap-2">
-                      <Layers className="w-4 h-4 text-[#006A6A]" />
-                      <span>Klasemen Pool & Sistem Gugur (Rookie Fix Mix)</span>
-                    </h3>
+                    <h2 className="text-xl font-bold text-[#191C1C] flex items-center gap-2 font-display">
+                      <Trophy className="w-5 h-5 text-[#006A6A]" />
+                      <span>Daftar Turnamen Padel</span>
+                    </h2>
                     <p className="text-xs text-[#6F7978] mt-0.5">
-                      Top 2 dari setiap Pool otomatis lolos ke Babak 16 Besar (Knockout Draw).
+                      Pilih kejuaraan untuk melihat bagan sistem gugur, live skor, jadwal, dan klasemen.
                     </p>
                   </div>
 
-                  <div className="flex items-center gap-2 self-start sm:self-auto flex-wrap">
-                    <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-mono font-bold">
-                      <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
-                      <span>Turnamen Sedang Berlangsung</span>
+                  {/* Filter tabs & Admin Quick Access */}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <div className="inline-flex p-1 bg-white border border-[#D8DFDE] rounded-xl gap-1 shadow-2xs">
+                      {(['semua', 'Live', 'Akan Datang', 'Selesai'] as const).map((st) => (
+                        <button
+                          key={st}
+                          type="button"
+                          onClick={() => setGuestStatusFilter(st)}
+                          className={`px-2.5 py-1 text-xs font-semibold rounded-lg transition-all ${
+                            guestStatusFilter === st
+                              ? 'bg-[#006A6A] text-white shadow-2xs'
+                              : 'text-[#6F7978] hover:text-[#191C1C]'
+                          }`}
+                        >
+                          {st === 'semua' ? `Semua (${storedTournaments.length})` : st}
+                        </button>
+                      ))}
                     </div>
+                  </div>
+                </div>
 
-                    {/* Tombol Full Screen Klasemen */}
-                    <button
-                      type="button"
-                      onClick={toggleStandingsFullscreen}
-                      className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer ${
-                        isStandingsFullscreen
-                          ? 'bg-[#BA1A1A] hover:bg-red-700 text-white'
-                          : 'bg-white hover:bg-[#EEF4F3] border border-[#D8DFDE] text-[#191C1C] hover:text-[#006A6A]'
-                      }`}
-                      title={isStandingsFullscreen ? 'Keluar dari Mode Full Screen (Esc)' : 'Buka kotak klasemen ini dalam mode Layar Penuh'}
-                    >
-                      {isStandingsFullscreen ? (
-                        <>
+                {tournamentsList.length === 0 ? (
+                  <div className="p-10 sm:p-12 text-center rounded-2xl bg-white border border-[#D8DFDE] shadow-xs space-y-3">
+                    <div className="w-12 h-12 rounded-2xl bg-[#006A6A]/10 text-[#006A6A] flex items-center justify-center mx-auto">
+                      <Trophy className="w-6 h-6" />
+                    </div>
+                    <h3 className="text-base font-bold text-[#191C1C]">
+                      {storedTournaments.length === 0 ? 'Belum Ada Turnamen Aktif' : 'Tidak Ada Turnamen Ditemukan'}
+                    </h3>
+                    <p className="text-xs text-[#3D5A57] max-w-md mx-auto leading-relaxed">
+                      {storedTournaments.length === 0
+                        ? 'Belum ada turnamen yang dipublikasikan oleh admin, mohon coba lagi nanti.'
+                        : 'Tidak ada turnamen yang cocok dengan filter status terpilih.'}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    {tournamentsList.map((item) => (
+                      <div
+                        key={item.id}
+                        onClick={() => {
+                          setSelectedTournament(item.id);
+                          setOpenedTournamentId(item.id);
+                          setTournamentSubTab('juara');
+                          setPoolFilter('Semua Pool');
+                          setParticipantSearch('');
+                          setMatchFilter('semua');
+                          window.scrollTo({ top: 0, behavior: 'smooth' });
+                        }}
+                        className="p-5 rounded-2xl border border-[#D8DFDE] bg-white hover:border-[#006A6A] hover:shadow-md transition-all cursor-pointer shadow-xs group flex flex-col justify-between"
+                      >
+                        <div>
+                          {/* 16:9 Tournament Banner Image (Hanya tampil jika ada) */}
+                          {item.bannerUrl ? (
+                            <div className="aspect-video w-full rounded-xl overflow-hidden mb-3.5 bg-neutral-900 border border-[#D8DFDE] shadow-2xs relative">
+                              <img
+                                src={item.bannerUrl}
+                                alt={item.name}
+                                className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                                loading="lazy"
+                              />
+                            </div>
+                          ) : null}
+
+                          <div className="flex items-start justify-between gap-2 mb-2">
+                            <span className="text-xs font-mono text-[#006A6A] uppercase font-bold">
+                              {item.organizer}
+                            </span>
+                            <span
+                              className={`px-2.5 py-0.5 rounded-md text-[11px] font-bold ${
+                                item.status === 'Live'
+                                  ? 'bg-[#BA1A1A] text-white animate-pulse'
+                                  : item.status === 'Akan Datang'
+                                  ? 'bg-[#6E4D8B]/15 text-[#6E4D8B] border border-[#6E4D8B]/30'
+                                  : 'bg-[#006A6A]/10 text-[#006A6A] border border-[#006A6A]/30'
+                              }`}
+                            >
+                              {item.status === 'Live' ? '⚡ LIVE' : item.status === 'Akan Datang' ? '⏳ AKAN DATANG' : '✓ SELESAI'}
+                            </span>
+                          </div>
+
+                          <h3 className="text-base sm:text-lg font-bold text-[#191C1C] mb-2 font-display group-hover:text-[#006A6A] transition-colors">
+                            {item.name}
+                          </h3>
+
+                          <div className="space-y-1.5 text-xs text-[#3D5A57] mb-4">
+                            <div className="flex items-center gap-2">
+                              <MapPin className="w-3.5 h-3.5 text-[#006A6A]" />
+                              <span>{item.location} ({item.totalCourts} Courts)</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Calendar className="w-3.5 h-3.5 text-[#6F7978]" />
+                              <span>{item.date}</span>
+                            </div>
+                            <div className="text-[11px] text-[#6F7978]">
+                              Format: {item.rules}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between pt-3 border-t border-[#D8DFDE] text-xs">
+                          <span className="text-[#006A6A] font-semibold flex items-center gap-1 group-hover:underline">
+                            Klik untuk Buka Bagan & Pool
+                          </span>
+                          <ArrowRight className="w-3.5 h-3.5 text-[#6F7978] group-hover:text-[#006A6A] group-hover:translate-x-1 transition-all" />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Interactive Pool Standings & Knockout Bracket (Hanya Ditampilkan untuk Turnamen yang Sedang Berlangsung / Live) */}
+              {liveTourneyForHome && (
+                <>
+                  {/* Selector jika terdapat lebih dari 1 turnamen yang sedang Live */}
+                  {liveTournaments.length > 1 && (
+                    <div className="p-3.5 rounded-2xl bg-[#EEF4F3] border border-[#D8DFDE] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="flex items-center gap-2">
+                        <Activity className="w-4 h-4 text-emerald-600 animate-pulse" />
+                        <span className="text-xs font-bold text-[#191C1C]">
+                          Pilih Turnamen Sedang Berlangsung (Live):
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {liveTournaments.map((lt) => (
+                          <button
+                            key={lt.id}
+                            type="button"
+                            onClick={() => setSelectedLiveHomeId(lt.id)}
+                            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                              liveTourneyForHome.id === lt.id
+                                ? 'bg-[#006A6A] text-white shadow-xs'
+                                : 'bg-white hover:bg-[#EEF4F3] border border-[#D8DFDE] text-[#191C1C]'
+                            }`}
+                          >
+                            {lt.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Interactive Pool Standings */}
+                  <div
+                    ref={standingsRef}
+                    className={
+                      isStandingsFullscreen
+                        ? 'fixed inset-0 z-50 overflow-y-auto bg-[#F6FAF9] p-6 sm:p-10 space-y-6 shadow-2xl animate-in fade-in duration-200'
+                        : 'p-6 rounded-2xl bg-white border border-[#D8DFDE] space-y-6 shadow-xs'
+                    }
+                  >
+                    {/* Full Screen Top Banner */}
+                    {isStandingsFullscreen && (
+                      <div className="bg-[#191C1C] text-white px-4 sm:px-6 py-3 rounded-2xl flex items-center justify-between shadow-lg">
+                        <div className="flex items-center gap-2.5 text-xs">
+                          <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping" />
+                          <span className="font-mono font-bold tracking-wider uppercase text-emerald-300">
+                            Mode Layar Penuh: Klasemen Pool & Sistem Gugur ({liveTourneyForHome.name})
+                          </span>
+                          <span className="text-neutral-400 hidden sm:inline">
+                            · Tekan tombol [Esc] pada keyboard atau tombol merah untuk keluar
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={toggleStandingsFullscreen}
+                          className="px-3.5 py-1.5 rounded-xl bg-[#BA1A1A] hover:bg-red-700 text-white text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-md"
+                        >
                           <Minimize2 className="w-3.5 h-3.5" />
                           <span>Keluar Full Screen</span>
-                        </>
-                      ) : (
-                        <>
-                          <Maximize2 className="w-3.5 h-3.5 text-[#006A6A]" />
-                          <span>Full Screen</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
+                        </button>
+                      </div>
+                    )}
 
-                {/* Standings Table */}
-                <div className="overflow-x-auto rounded-xl border border-[#D8DFDE]">
-                  <table className="w-full text-left text-xs border-collapse">
-                    <thead>
-                      <tr className="bg-[#EEF4F3] border-b border-[#D8DFDE] text-[#6F7978] font-mono text-[11px] uppercase">
-                        <th className="py-2.5 px-3">Pos</th>
-                        <th className="py-2.5 px-3">Pasangan Pemain</th>
-                        <th className="py-2.5 px-3">Pool</th>
-                        <th className="py-2.5 px-3 text-center">Menang</th>
-                        <th className="py-2.5 px-3 text-center">Kalah</th>
-                        <th className="py-2.5 px-3 text-center">Selisih Game</th>
-                        <th className="py-2.5 px-3 text-right">Poin</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-[#D8DFDE] bg-white">
-                      {poolTeams.map((team, idx) => {
-                        const isQualified = idx % 4 < 2;
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div>
+                        <h3 className="text-lg font-bold text-[#191C1C] flex items-center gap-2">
+                          <Layers className="w-4 h-4 text-[#006A6A]" />
+                          <span>Klasemen Pool & Sistem Gugur ({liveTourneyForHome.name})</span>
+                        </h3>
+                        <p className="text-xs text-[#6F7978] mt-0.5">
+                          Top 2 dari setiap Pool otomatis lolos ke Babak Playoff (Knockout Draw).
+                        </p>
+                      </div>
 
-                        return (
-                          <tr key={team.id} className="hover:bg-[#F6FAF9] transition-colors">
-                            <td className="py-3 px-3 font-mono font-bold text-[#191C1C]">
-                              <span className={`inline-block w-5 h-5 text-center leading-5 rounded-md ${isQualified ? 'bg-[#006A6A] text-white' : 'text-[#6F7978]'}`}>
-                                {idx + 1}
-                              </span>
-                            </td>
-                            <td className="py-3 px-3">
-                              <div className="font-bold text-[#191C1C]">{team.name}</div>
-                              <div className="text-[11px] text-[#6F7978]">{team.p1} / {team.p2}</div>
-                            </td>
-                            <td className="py-3 px-3 font-mono text-[#6F7978]">{team.pool}</td>
-                            <td className="py-3 px-3 text-center font-mono text-[#191C1C]">{team.won}</td>
-                            <td className="py-3 px-3 text-center font-mono text-[#6F7978]">{team.lost}</td>
-                            <td className="py-3 px-3 text-center font-mono text-[#006A6A] font-bold">
-                              {team.gameDiff > 0 ? `+${team.gameDiff}` : team.gameDiff}
-                            </td>
-                            <td className="py-3 px-3 text-right font-mono font-bold text-[#191C1C] text-sm">
-                              {team.points}
-                            </td>
+                      <div className="flex items-center gap-2 self-start sm:self-auto flex-wrap">
+                        <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-mono font-bold">
+                          <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
+                          <span>Turnamen Sedang Berlangsung</span>
+                        </div>
+
+                        {/* Tombol Full Screen Klasemen */}
+                        <button
+                          type="button"
+                          onClick={toggleStandingsFullscreen}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer ${
+                            isStandingsFullscreen
+                              ? 'bg-[#BA1A1A] hover:bg-red-700 text-white'
+                              : 'bg-white hover:bg-[#EEF4F3] border border-[#D8DFDE] text-[#191C1C] hover:text-[#006A6A]'
+                          }`}
+                          title={isStandingsFullscreen ? 'Keluar dari Mode Full Screen (Esc)' : 'Buka kotak klasemen ini dalam mode Layar Penuh'}
+                        >
+                          {isStandingsFullscreen ? (
+                            <>
+                              <Minimize2 className="w-3.5 h-3.5" />
+                              <span>Keluar Full Screen</span>
+                            </>
+                          ) : (
+                            <>
+                              <Maximize2 className="w-3.5 h-3.5 text-[#006A6A]" />
+                              <span>Full Screen</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Standings Table */}
+                    <div className="overflow-x-auto rounded-xl border border-[#D8DFDE]">
+                      <table className="w-full text-left text-xs border-collapse">
+                        <thead>
+                          <tr className="bg-[#EEF4F3] border-b border-[#D8DFDE] text-[#6F7978] font-mono text-[11px] uppercase">
+                            <th className="py-2.5 px-3">Pos</th>
+                            <th className="py-2.5 px-3">Pasangan Pemain</th>
+                            <th className="py-2.5 px-3">Pool</th>
+                            <th className="py-2.5 px-3 text-center">Menang</th>
+                            <th className="py-2.5 px-3 text-center">Kalah</th>
+                            <th className="py-2.5 px-3 text-center">Selisih Game</th>
+                            <th className="py-2.5 px-3 text-right">Poin</th>
                           </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+                        </thead>
+                        <tbody className="divide-y divide-[#D8DFDE] bg-white">
+                          {poolTeams.length === 0 ? (
+                            <tr>
+                              <td colSpan={7} className="py-10 text-center text-[#6F7978]">
+                                <div className="space-y-1">
+                                  <p className="text-xs font-bold text-[#191C1C]">Klasemen Pool Belum Tersedia</p>
+                                  <p className="text-[11px] text-[#6F7978]">
+                                    Belum ada pertandingan aktif untuk ditampilkan dalam tabel klasemen.
+                                  </p>
+                                </div>
+                              </td>
+                            </tr>
+                          ) : (
+                            poolTeams.map((team, idx) => {
+                              const isQualified = idx % 4 < 2;
 
-              {/* Knockout Bracket Visual (Tampilan Default Halaman Awal) */}
-              <div className="p-6 rounded-2xl bg-white border border-[#D8DFDE] space-y-6 shadow-xs">
-                <h3 className="text-lg font-bold text-[#191C1C] flex items-center gap-2">
-                  <Trophy className="w-4 h-4 text-[#006A6A]" />
-                  <span>Bagan Sistem Gugur (Knockout Bracket)</span>
-                </h3>
-
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-xs">
-                  {/* Quarter Final */}
-                  <div className="space-y-4">
-                    <span className="text-[#6F7978] uppercase font-mono text-[11px] block font-semibold">
-                      Perempat Final (Race to 4)
-                    </span>
-                    <div className="p-3 rounded-xl bg-[#F6FAF9] border border-[#D8DFDE] space-y-2">
-                      <div className="flex justify-between font-bold text-[#191C1C]">
-                        <span>Olivia & Rico (Pool A)</span>
-                        <span className="text-[#006A6A] font-mono">4</span>
-                      </div>
-                      <div className="flex justify-between text-[#6F7978]">
-                        <span>Evan & Ngoe (Pool B)</span>
-                        <span className="font-mono">2</span>
-                      </div>
-                    </div>
-
-                    <div className="p-3 rounded-xl bg-[#F6FAF9] border border-[#D8DFDE] space-y-2">
-                      <div className="flex justify-between font-bold text-[#191C1C]">
-                        <span>Kartika & Dodie (Pool B)</span>
-                        <span className="text-[#006A6A] font-mono">4</span>
-                      </div>
-                      <div className="flex justify-between text-[#6F7978]">
-                        <span>Erde & Sie Jiang (Pool A)</span>
-                        <span className="font-mono">1</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Semi Final */}
-                  <div className="space-y-4">
-                    <span className="text-[#6F7978] uppercase font-mono text-[11px] block font-semibold">
-                      Semifinal (Race to 6)
-                    </span>
-                    <div className="p-3.5 rounded-xl bg-[#F6FAF9] border border-[#006A6A]/40 space-y-2.5">
-                      <div className="flex justify-between font-bold text-[#191C1C]">
-                        <span>Olivia & Rico</span>
-                        <span className="text-[#006A6A] font-mono">6</span>
-                      </div>
-                      <div className="flex justify-between text-[#6F7978]">
-                        <span>Kartika & Dodie</span>
-                        <span className="font-mono">4</span>
-                      </div>
-                      <div className="text-[10px] text-[#6F7978] font-mono pt-1 border-t border-[#D8DFDE]">
-                        Court 2 · Selesai
-                      </div>
+                              return (
+                                <tr key={team.id} className="hover:bg-[#F6FAF9] transition-colors">
+                                  <td className="py-3 px-3 font-mono font-bold text-[#191C1C]">
+                                    <span className={`inline-block w-5 h-5 text-center leading-5 rounded-md ${isQualified ? 'bg-[#006A6A] text-white' : 'text-[#6F7978]'}`}>
+                                      {idx + 1}
+                                    </span>
+                                  </td>
+                                  <td className="py-3 px-3">
+                                    <div className="font-bold text-[#191C1C]">{team.name}</div>
+                                    <div className="text-[11px] text-[#6F7978]">{team.p1} / {team.p2}</div>
+                                  </td>
+                                  <td className="py-3 px-3 font-mono text-[#6F7978]">{team.pool}</td>
+                                  <td className="py-3 px-3 text-center font-mono text-[#191C1C]">{team.won}</td>
+                                  <td className="py-3 px-3 text-center font-mono text-[#6F7978]">{team.lost}</td>
+                                  <td className="py-3 px-3 text-center font-mono text-[#006A6A] font-bold">
+                                    {team.gameDiff > 0 ? `+${team.gameDiff}` : team.gameDiff}
+                                  </td>
+                                  <td className="py-3 px-3 text-right font-mono font-bold text-[#191C1C] text-sm">
+                                    {team.points}
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          )}
+                        </tbody>
+                      </table>
                     </div>
                   </div>
 
-                  {/* Grand Final */}
-                  <div className="space-y-4">
-                    <span className="text-[#6E4D8B] uppercase font-mono text-[11px] block flex items-center gap-1 font-bold">
-                      <Trophy className="w-3.5 h-3.5 text-[#6E4D8B]" />
-                      Grand Final (Gold Match)
-                    </span>
-                    <div className="p-4 rounded-xl bg-gradient-to-b from-[#6E4D8B]/10 to-[#F6FAF9] border border-[#6E4D8B]/40 space-y-3 shadow-sm">
-                      <div className="flex justify-between font-bold text-[#191C1C] text-sm">
-                        <span>Olivia & Rico</span>
-                        <span className="text-[#6E4D8B] font-mono font-black">6</span>
+                  {/* Knockout Bracket Visual */}
+                  <div className="p-6 rounded-2xl bg-white border border-[#D8DFDE] space-y-6 shadow-xs">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div>
+                        <h3 className="text-lg font-bold text-[#191C1C] flex items-center gap-2">
+                          <Trophy className="w-4 h-4 text-[#006A6A]" />
+                          <span>Bagan Sistem Gugur (Knockout Bracket) - {liveTourneyForHome.name}</span>
+                        </h3>
+                        <p className="text-xs text-[#6F7978] mt-0.5">
+                          Bagan resmi babak gugur turnamen {liveTourneyForHome.name} yang sedang berlangsung.
+                        </p>
                       </div>
-                      <div className="flex justify-between text-[#3D5A57]">
-                        <span>Team F3 Men Champion</span>
-                        <span className="font-mono font-bold">4</span>
-                      </div>
-                      <div className="pt-2 border-t border-[#D8DFDE] flex items-center justify-between text-[11px]">
-                        <span className="text-[#6E4D8B] font-bold">🏆 JUARA 1 (GOLD)</span>
-                        <span className="text-[#6F7978] font-mono">All In Padel Court 1</span>
-                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOpenedTournamentId(liveTourneyForHome.id);
+                          setTournamentSubTab('bracket');
+                          window.scrollTo({ top: 0, behavior: 'smooth' });
+                        }}
+                        className="px-3.5 py-1.5 rounded-xl bg-[#006A6A]/10 hover:bg-[#006A6A] text-[#006A6A] hover:text-white text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 self-start sm:self-auto cursor-pointer"
+                      >
+                        <Trophy className="w-3.5 h-3.5" />
+                        <span>Lihat Detail Bracket Lengkap</span>
+                      </button>
                     </div>
+
+                    <KnockoutBracketVisualizer
+                      roundOf16={liveKnockoutBracket.roundOf16}
+                      quarters={liveKnockoutBracket.quarters}
+                      semis={liveKnockoutBracket.semis}
+                      grandFinal={liveKnockoutBracket.grandFinal}
+                      bronzeMatch={liveKnockoutBracket.bronzeMatch}
+                      tournamentName={liveTourneyForHome.name}
+                    />
                   </div>
-                </div>
-              </div>
+                </>
+              )}
+            </div>
+          ) : !activeTourney ? (
+            <div className="p-12 text-center bg-white rounded-2xl border border-[#D8DFDE] space-y-3">
+              <Trophy className="w-10 h-10 text-[#6F7978]/40 mx-auto" />
+              <h3 className="text-base font-bold text-[#191C1C]">Turnamen Tidak Ditemukan</h3>
+              <p className="text-xs text-[#6F7978]">Data turnamen ini mungkin belum ada atau telah dihapus.</p>
+              <button
+                type="button"
+                onClick={() => setOpenedTournamentId(null)}
+                className="px-4 py-2 rounded-xl bg-[#006A6A] text-white text-xs font-bold cursor-pointer"
+              >
+                Kembali ke Daftar Turnamen
+              </button>
             </div>
           ) : (
             /* KONDISI 2: PINDAH HALAMAN (HALAMAN DEDIKASI DETAIL TURNAMEN DENGAN 5 TOMBOL) */
@@ -646,7 +996,7 @@ export const PadelProTournamentApp: React.FC = () => {
                   className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white hover:bg-[#EEF4F3] border border-[#D8DFDE] text-[#006A6A] hover:text-[#007A7C] text-xs font-bold transition-all shadow-xs cursor-pointer self-start"
                 >
                   <ArrowLeft className="w-4 h-4" />
-                  <span>← Kembali ke Daftar Turnamen</span>
+                  <span>Kembali ke Daftar Turnamen</span>
                 </button>
 
                 <div className="text-xs text-[#6F7978] font-mono flex items-center gap-1.5 flex-wrap">
@@ -697,6 +1047,17 @@ export const PadelProTournamentApp: React.FC = () => {
                   </div>
                 )}
 
+                {/* 16:9 Tournament Banner Header (Hanya tampil jika diunggah oleh admin) */}
+                {activeTourney.bannerUrl ? (
+                  <div className="aspect-video w-full rounded-2xl overflow-hidden border border-[#D8DFDE] bg-neutral-900 shadow-sm relative">
+                    <img
+                      src={activeTourney.bannerUrl}
+                      alt={activeTourney.name}
+                      className="w-full h-full object-cover"
+                    />
+                  </div>
+                ) : null}
+
                 {/* Header: Selected Tournament Info */}
                 <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-6 border-b border-[#D8DFDE]">
                   <div className="space-y-1.5">
@@ -708,10 +1069,16 @@ export const PadelProTournamentApp: React.FC = () => {
                         className={`px-2.5 py-0.5 rounded-md text-[11px] font-bold ${
                           activeTourney.status === 'Live'
                             ? 'bg-[#BA1A1A] text-white animate-pulse'
+                            : activeTourney.status === 'Akan Datang'
+                            ? 'bg-[#6E4D8B] text-white'
                             : 'bg-emerald-100 text-emerald-800 border border-emerald-300'
                         }`}
                       >
-                        {activeTourney.status === 'Live' ? '⚡ LIVE TOURNAMENT' : '✓ TURNAMEN SELESAI'}
+                        {activeTourney.status === 'Live'
+                          ? '⚡ LIVE TOURNAMENT'
+                          : activeTourney.status === 'Akan Datang'
+                          ? '⏳ AKAN DATANG'
+                          : '✓ TURNAMEN SELESAI'}
                       </span>
                     </div>
 
@@ -728,10 +1095,19 @@ export const PadelProTournamentApp: React.FC = () => {
                         <Calendar className="w-3.5 h-3.5 text-[#6F7978]" />
                         <span>{activeTourney.date}</span>
                       </span>
-                      <span className="flex items-center gap-1.5 font-mono text-[#006A6A] font-bold">
-                        <Trophy className="w-3.5 h-3.5 text-[#006A6A]" />
-                        <span>Hadiah: {activeTourney.prizePool}</span>
-                      </span>
+                      {Boolean(
+                        activeTourney.prizePool &&
+                          activeTourney.prizePool.trim() !== '' &&
+                          activeTourney.prizePool.trim() !== '-' &&
+                          activeTourney.prizePool.toLowerCase() !== 'tidak ada' &&
+                          activeTourney.prizePool.toLowerCase() !== 'trofi & sertifikat' &&
+                          activeTourney.prizePool.toLowerCase() !== 'trofi dan sertifikat'
+                      ) && (
+                        <span className="flex items-center gap-1.5 font-mono text-[#006A6A] font-bold">
+                          <Trophy className="w-3.5 h-3.5 text-[#006A6A]" />
+                          <span>Hadiah: {activeTourney.prizePool}</span>
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -745,30 +1121,6 @@ export const PadelProTournamentApp: React.FC = () => {
                         <span>Lihat Skor Pertandingan Live</span>
                       </button>
                     )}
-
-                    {/* Tombol Full Screen Tournament Hub */}
-                    <button
-                      type="button"
-                      onClick={toggleHubFullscreen}
-                      className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-xs ${
-                        isHubFullscreen
-                          ? 'bg-[#BA1A1A] hover:bg-red-700 text-white'
-                          : 'bg-white hover:bg-[#EEF4F3] border border-[#D8DFDE] text-[#191C1C] hover:text-[#006A6A]'
-                      }`}
-                      title={isHubFullscreen ? 'Keluar Mode Layar Penuh (Esc)' : 'Buka kotak turnamen ini dalam mode Layar Penuh (Full Screen)'}
-                    >
-                      {isHubFullscreen ? (
-                        <>
-                          <Minimize2 className="w-3.5 h-3.5" />
-                          <span>Keluar Full Screen</span>
-                        </>
-                      ) : (
-                        <>
-                          <Maximize2 className="w-3.5 h-3.5 text-[#006A6A]" />
-                          <span>Full Screen</span>
-                        </>
-                      )}
-                    </button>
                   </div>
                 </div>
 
@@ -776,17 +1128,14 @@ export const PadelProTournamentApp: React.FC = () => {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-mono text-[#6F7978] uppercase font-bold tracking-wider">
-                      Menu Informasi Turnamen (Pilih untuk Membuka):
-                    </span>
-                    <span className="text-[11px] font-mono text-[#006A6A] font-semibold">
-                      5 Menu Lengkap Tersedia
+                      Informasi Turnamen:
                     </span>
                   </div>
 
                   <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
                     {[
                       { id: 'juara', label: 'DAFTAR JUARA', icon: Trophy, desc: 'Podium & Hadiah' },
-                      { id: 'peserta', label: 'LIST PESERTA', icon: Users, desc: `${activeTourney.participants.length} Pasangan` },
+                      { id: 'peserta', label: 'LIST PESERTA', icon: Users, desc: `${effectiveParticipants.length} Pasangan` },
                       { id: 'hasil', label: 'HASIL PERTANDINGAN', icon: Activity, desc: `${activeTourney.matches.length} Match` },
                       { id: 'bracket', label: 'BRACKET KNOCK OUT', icon: Sparkles, desc: 'Bagan Playoff' },
                       { id: 'klasemen', label: 'KLASEMEN GRUP', icon: Layers, desc: 'Pool Standings' }
@@ -836,7 +1185,7 @@ export const PadelProTournamentApp: React.FC = () => {
                       }`}>
                         <Award className={`w-5 h-5 shrink-0 ${activeTourney.status === 'Live' ? 'text-amber-600' : 'text-[#006A6A]'}`} />
                         <div className="text-xs leading-relaxed">
-                          <strong className="block font-bold">Catatan Resmi Panitia Turnamen:</strong>
+                          <strong className="block font-bold">Catatan Panitia Turnamen:</strong>
                           <span>{activeTourney.winners.notes}</span>
                         </div>
                       </div>
@@ -886,9 +1235,11 @@ export const PadelProTournamentApp: React.FC = () => {
                               <p className="text-xs text-[#6F7978]">
                                 Pemain: {win.p1} & {win.p2}
                               </p>
-                              <p className="text-xs font-semibold text-[#006A6A]">
-                                Klub: {win.club}
-                              </p>
+                              {win.club && (
+                                <p className="text-xs font-semibold text-[#006A6A]">
+                                  Klub: {win.club}
+                                </p>
+                              )}
                             </div>
 
                             <div className="pt-3 border-t border-[#D8DFDE] space-y-2 text-xs">
@@ -945,7 +1296,7 @@ export const PadelProTournamentApp: React.FC = () => {
                         <Search className="w-4 h-4 text-[#6F7978] absolute left-3.5 top-1/2 -translate-y-1/2" />
                         <input
                           type="text"
-                          placeholder="Cari nama pemain, partner, klub..."
+                          placeholder="Cari nama pemain, partner, kota, atau ID..."
                           value={participantSearch}
                           onChange={(e) => setParticipantSearch(e.target.value)}
                           className="w-full pl-10 pr-4 py-2 rounded-xl bg-white border border-[#D8DFDE] text-xs text-[#191C1C] placeholder-[#6F7978] focus:outline-none focus:border-[#006A6A]"
@@ -955,7 +1306,7 @@ export const PadelProTournamentApp: React.FC = () => {
                       <div className="flex items-center gap-2 overflow-x-auto pb-1">
                         <Filter className="w-3.5 h-3.5 text-[#6F7978] shrink-0" />
                         <span className="text-xs font-mono text-[#6F7978] shrink-0">Filter Pool:</span>
-                        {activeTourney.groupStandings.pools.map((p) => (
+                        {effectiveGroupStandings.pools.map((p) => (
                           <button
                             key={p}
                             onClick={() => setPoolFilter(p)}
@@ -977,22 +1328,21 @@ export const PadelProTournamentApp: React.FC = () => {
                         <thead>
                           <tr className="bg-[#EEF4F3] border-b border-[#D8DFDE] text-[#6F7978] font-mono text-[11px] uppercase">
                             <th className="py-3 px-3.5 text-center">Seed / No</th>
-                            <th className="py-3 px-4">Pasangan Pemain</th>
-                            <th className="py-3 px-3 text-center">Rating</th>
-                            <th className="py-3 px-4">Asal Klub & Kota</th>
+                            <th className="py-3 px-3 text-center">Foto</th>
+                            <th className="py-3 px-4">Pasangan Pemain & ID Member</th>
+                            <th className="py-3 px-4">Kota</th>
                             <th className="py-3 px-3 text-center">Pool</th>
-                            <th className="py-3 px-3.5 text-center">Status</th>
+                            <th className="py-3 px-3.5 text-center">Status & Kualifikasi</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-[#D8DFDE] bg-white">
-                          {activeTourney.participants
+                          {effectiveParticipants
                             .filter((item) => {
                               const matchesSearch =
                                 participantSearch === '' ||
                                 item.teamName.toLowerCase().includes(participantSearch.toLowerCase()) ||
                                 item.p1.toLowerCase().includes(participantSearch.toLowerCase()) ||
                                 item.p2.toLowerCase().includes(participantSearch.toLowerCase()) ||
-                                item.club.toLowerCase().includes(participantSearch.toLowerCase()) ||
                                 item.city.toLowerCase().includes(participantSearch.toLowerCase());
 
                               const matchesPool =
@@ -1000,42 +1350,104 @@ export const PadelProTournamentApp: React.FC = () => {
 
                               return matchesSearch && matchesPool;
                             })
-                            .map((team, idx) => (
-                              <tr key={idx} className="hover:bg-[#F6FAF9] transition-colors">
-                                <td className="py-3 px-3.5 text-center font-mono font-bold text-[#191C1C]">
-                                  <span className="inline-block w-6 h-6 leading-6 rounded-md bg-[#EEF4F3] border border-[#D8DFDE] text-[#006A6A]">
-                                    #{team.seed}
-                                  </span>
-                                </td>
-                                <td className="py-3 px-4">
-                                  <div className="font-bold text-[#191C1C] text-sm">{team.teamName}</div>
-                                  <div className="text-[11px] text-[#6F7978]">
-                                    {team.p1} & {team.p2}
-                                  </div>
-                                </td>
-                                <td className="py-3 px-3 text-center font-mono font-bold text-[#006A6A]">
-                                  {team.rating}
-                                </td>
-                                <td className="py-3 px-4 text-[#3D5A57]">
-                                  <div>{team.club}</div>
-                                  <div className="text-[11px] text-[#6F7978]">{team.city}</div>
-                                </td>
-                                <td className="py-3 px-3 text-center font-mono font-bold text-[#191C1C]">
-                                  {team.pool}
-                                </td>
-                                <td className="py-3 px-3.5 text-center">
-                                  <span
-                                    className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
-                                      team.status === 'Playoff'
-                                        ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
-                                        : 'bg-[#006A6A]/10 text-[#006A6A] border border-[#006A6A]/30'
-                                    }`}
-                                  >
-                                    {team.status}
-                                  </span>
-                                </td>
-                              </tr>
-                            ))}
+                            .map((team, idx) => {
+                              const mem1 = lookupMemberByName(team.p1);
+                              const mem2 = lookupMemberByName(team.p2);
+                              const p1Photo = mem1?.photoUrl || lookupPlayerPhoto(team.p1);
+                              const p2Photo = mem2?.photoUrl || lookupPlayerPhoto(team.p2);
+                              const hasMatchesPlayed =
+                                (activeTourney.matches?.length || 0) > 0 ||
+                                (effectiveGroupStandings?.standings?.some((s) => (s.played || 0) > 0) ?? false);
+                              const standingEntry = effectiveGroupStandings?.standings?.find(
+                                (s) => s.name === team.teamName
+                              );
+                              const isQualified =
+                                hasMatchesPlayed &&
+                                ((standingEntry?.played || 0) > 0 && (standingEntry?.isQualified || team.status === 'Playoff'));
+
+                              return (
+                                <tr key={idx} className="hover:bg-[#F6FAF9] transition-colors">
+                                  <td className="py-3.5 px-3.5 text-center font-mono font-bold text-[#191C1C]">
+                                    <span className="inline-block w-6 h-6 leading-6 rounded-md bg-[#EEF4F3] border border-[#D8DFDE] text-[#006A6A]">
+                                      #{team.seed}
+                                    </span>
+                                  </td>
+
+                                  {/* Player Photos */}
+                                  <td className="py-3.5 px-3 text-center">
+                                    <div className="flex items-center justify-center -space-x-2">
+                                      <img
+                                        src={p1Photo}
+                                        alt={team.p1}
+                                        className="w-8 h-8 rounded-full object-cover border-2 border-white shadow-xs"
+                                        title={team.p1}
+                                      />
+                                      <img
+                                        src={p2Photo}
+                                        alt={team.p2}
+                                        className="w-8 h-8 rounded-full object-cover border-2 border-white shadow-xs"
+                                        title={team.p2}
+                                      />
+                                    </div>
+                                  </td>
+
+                                  {/* Team & Member IDs */}
+                                  <td className="py-3.5 px-4">
+                                    <div className="font-bold text-[#191C1C] text-sm">{team.teamName}</div>
+                                    <div className="text-[11px] text-[#6F7978] flex items-center gap-1.5 flex-wrap mt-0.5">
+                                      <span>
+                                        {mem1?.id && (
+                                          <span className="px-1.5 py-0.2 rounded bg-[#006A6A]/10 text-[#006A6A] font-mono text-[9px] font-bold mr-1">
+                                            {mem1.id}
+                                          </span>
+                                        )}
+                                        {team.p1}
+                                      </span>
+                                      <span>&</span>
+                                      <span>
+                                        {mem2?.id && (
+                                          <span className="px-1.5 py-0.2 rounded bg-[#006A6A]/10 text-[#006A6A] font-mono text-[9px] font-bold mr-1">
+                                            {mem2.id}
+                                          </span>
+                                        )}
+                                        {team.p2}
+                                      </span>
+                                    </div>
+                                  </td>
+
+                                  <td className="py-3.5 px-4 text-[#3D5A57]">
+                                    <div className="font-semibold text-[#191C1C] flex items-center gap-1.5">
+                                      <MapPin className="w-3.5 h-3.5 text-[#006A6A]" />
+                                      <span>{team.city || '-'}</span>
+                                    </div>
+                                  </td>
+
+                                  <td className="py-3.5 px-3 text-center font-mono font-bold text-[#191C1C]">
+                                    {team.pool}
+                                  </td>
+
+                                  {/* Status & Special Qualified Parameter */}
+                                  <td className="py-3.5 px-3.5 text-center">
+                                    <div className="space-y-1 inline-flex flex-col items-center">
+                                      <span
+                                        className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
+                                          isQualified
+                                            ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                                            : 'bg-[#006A6A]/10 text-[#006A6A] border border-[#006A6A]/30'
+                                        }`}
+                                      >
+                                        {isQualified ? '✓ Lolos Fase Grup (Playoff)' : team.status}
+                                      </span>
+                                      {isQualified && (
+                                        <span className="text-[9px] text-emerald-800 font-mono font-bold">
+                                          Playoff Qualified
+                                        </span>
+                                      )}
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            })}
                         </tbody>
                       </table>
                     </div>
@@ -1046,35 +1458,90 @@ export const PadelProTournamentApp: React.FC = () => {
                 {tournamentSubTab === 'hasil' && (
                   <div className="space-y-5 animate-in fade-in duration-200">
                     {/* Round Filter */}
+                    {/* Round Filter */}
                     <div className="flex items-center justify-between flex-wrap gap-2">
                       <span className="text-xs font-mono text-[#6F7978]">Filter Kategori Babak:</span>
-                      <div className="flex items-center gap-2">
-                        {[
-                          { id: 'semua', label: 'Semua Babak' },
-                          { id: 'grup', label: 'Babak Pool / Grup' },
-                          { id: 'knockout', label: 'Knockout / Playoff' },
-                          { id: 'final', label: 'Grand Final & Bronze' }
-                        ].map((f) => (
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <button
+                          type="button"
+                          onClick={() => setMatchFilter('semua')}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
+                            matchFilter === 'semua'
+                              ? 'bg-[#006A6A] text-white shadow-xs'
+                              : 'bg-[#F6FAF9] text-[#6F7978] hover:text-[#191C1C] border border-[#D8DFDE]'
+                          }`}
+                        >
+                          Semua Babak
+                        </button>
+
+                        {/* Individual Pool Stage Filters */}
+                        {(effectiveGroupStandings?.pools?.filter((p) => p !== 'Semua Pool') || ['Pool A', 'Pool B']).map((pName) => (
                           <button
-                            key={f.id}
-                            onClick={() => setMatchFilter(f.id as any)}
+                            key={pName}
+                            type="button"
+                            onClick={() => setMatchFilter(`pool:${pName}`)}
                             className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
-                              matchFilter === f.id
+                              matchFilter === `pool:${pName}`
                                 ? 'bg-[#006A6A] text-white shadow-xs'
                                 : 'bg-[#F6FAF9] text-[#6F7978] hover:text-[#191C1C] border border-[#D8DFDE]'
                             }`}
                           >
-                            {f.label}
+                            {pName}
                           </button>
                         ))}
+
+                        <button
+                          type="button"
+                          onClick={() => setMatchFilter('knockout')}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
+                            matchFilter === 'knockout'
+                              ? 'bg-[#006A6A] text-white shadow-xs'
+                              : 'bg-[#F6FAF9] text-[#6F7978] hover:text-[#191C1C] border border-[#D8DFDE]'
+                          }`}
+                        >
+                          Knockout / Playoff
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setMatchFilter('final')}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
+                            matchFilter === 'final'
+                              ? 'bg-[#006A6A] text-white shadow-xs'
+                              : 'bg-[#F6FAF9] text-[#6F7978] hover:text-[#191C1C] border border-[#D8DFDE]'
+                          }`}
+                        >
+                          Grand Final & Bronze
+                        </button>
                       </div>
                     </div>
 
                     {/* Match Cards List */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      {activeTourney.matches
-                        .filter((m) => matchFilter === 'semua' || m.roundCategory === matchFilter)
-                        .map((match) => (
+                    {(() => {
+                      const allMatches = (() => {
+                        const generated = getOrGeneratePoolMatches(activeTourney.id);
+                        const existing = activeTourney.matches || [];
+                        const map = new Map<string, typeof existing[0]>();
+                        generated.forEach((m) => map.set(m.id, m));
+                        existing.forEach((m) => map.set(m.id, m));
+                        return Array.from(map.values());
+                      })();
+
+                      const filtered = allMatches.filter((m) => {
+                        if (matchFilter === 'semua') return true;
+                        if (matchFilter === 'grup') return m.roundCategory === 'grup' || m.round.toLowerCase().includes('pool');
+                        if (matchFilter === 'knockout') return m.roundCategory === 'knockout';
+                        if (matchFilter === 'final') return m.roundCategory === 'final';
+                        if (matchFilter.startsWith('pool:')) {
+                          const target = matchFilter.replace('pool:', '');
+                          return m.round.includes(target) || m.round.toLowerCase().includes(target.toLowerCase());
+                        }
+                        return true;
+                      });
+
+                      return (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {filtered.map((match) => (
                           <div
                             key={match.id}
                             className={`p-4 rounded-2xl border transition-all ${
@@ -1143,8 +1610,10 @@ export const PadelProTournamentApp: React.FC = () => {
                           </div>
                         ))}
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
+              </div>
+            )}
 
                 {/* TAB CONTENT 4: BRACKET KNOCK OUT */}
                 {tournamentSubTab === 'bracket' && (
@@ -1186,25 +1655,11 @@ export const PadelProTournamentApp: React.FC = () => {
                           <span>Bagan Sistem Gugur (Knockout Bracket Tree)</span>
                         </h4>
                         <p className="text-xs text-[#6F7978] mt-0.5">
-                          Visual bagan playoff resmi untuk menentukan sang juara.
+                          Visual bagan playoff turnamen.
                         </p>
                       </div>
 
                       <div className="flex items-center gap-2 flex-wrap">
-                        {/* Tombol Ubah Bracket untuk Super Admin */}
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShowAdminPortal(true);
-                            window.scrollTo({ top: 0, behavior: 'smooth' });
-                          }}
-                          className="px-3 py-1.5 rounded-xl bg-[#006A6A]/10 hover:bg-[#006A6A] text-[#006A6A] hover:text-white text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer border border-[#006A6A]/20"
-                          title="Masuk sebagai Super Admin untuk mengisi atau mengubah tim dan skor bagan sistem gugur"
-                        >
-                          <ShieldCheck className="w-3.5 h-3.5" />
-                          <span>Ubah Bracket (Super Admin)</span>
-                        </button>
-
                         {/* Tombol Full Screen Bagan */}
                         <button
                           type="button"
@@ -1228,10 +1683,6 @@ export const PadelProTournamentApp: React.FC = () => {
                             </>
                           )}
                         </button>
-
-                        <span className="text-xs font-mono text-[#006A6A] bg-[#EEF4F3] px-3 py-1 rounded-lg font-bold border border-[#D8DFDE]">
-                          Official Draw
-                        </span>
                       </div>
                     </div>
 
@@ -1247,104 +1698,156 @@ export const PadelProTournamentApp: React.FC = () => {
                   </div>
                 )}
 
-                {/* TAB CONTENT 5: KLASEMEN GRUP */}
-                {tournamentSubTab === 'klasemen' && (
-                  <div className="space-y-6 animate-in fade-in duration-200">
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                      <div>
-                        <h4 className="text-base font-bold text-[#191C1C] flex items-center gap-2">
-                          <Layers className="w-4 h-4 text-[#006A6A]" />
-                          <span>Klasemen Pool & Sistem Gugur</span>
-                        </h4>
-                        <p className="text-xs text-[#6F7978] mt-0.5">
-                          Top 2 dari setiap Pool otomatis lolos ke Babak Playoff (Knockout Draw).
-                        </p>
+                {/* TAB CONTENT 5: KLASEMEN GRUP (TABEL UNTUK TIAP POOL) */}
+                {tournamentSubTab === 'klasemen' && (() => {
+                  const distinctPools = (effectiveGroupStandings?.pools || []).filter(
+                    (p) => p !== 'Semua Pool' && p.trim() !== ''
+                  );
+                  const activePoolList =
+                    distinctPools.length > 0
+                      ? distinctPools
+                      : Array.from(
+                          new Set(
+                            (effectiveGroupStandings?.standings || [])
+                              .map((s) => s.pool)
+                              .filter((p): p is string => Boolean(p && p !== 'Semua Pool'))
+                          )
+                        );
+                  const poolsToRender =
+                    poolFilter === 'Semua Pool'
+                      ? activePoolList
+                      : activePoolList.filter((p) => p === poolFilter);
+
+                  return (
+                    <div className="space-y-6 animate-in fade-in duration-200">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div>
+                          <h4 className="text-base font-bold text-[#191C1C] flex items-center gap-2">
+                            <Layers className="w-4 h-4 text-[#006A6A]" />
+                            <span>Klasemen Pool</span>
+                          </h4>
+                          <p className="text-xs text-[#6F7978] mt-0.5">
+                            Tabel klasemen per pool · Top 2 dari setiap Pool otomatis lolos ke Babak Playoff.
+                          </p>
+                        </div>
                       </div>
 
-                      <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
-                        {activeTourney.groupStandings.pools.map((p) => (
-                          <button
-                            key={p}
-                            onClick={() => setPoolFilter(p)}
-                            className={`px-3 py-1.5 rounded-xl text-xs font-semibold whitespace-nowrap transition-all cursor-pointer ${
-                              poolFilter === p
-                                ? 'bg-[#006A6A] text-white shadow-xs'
-                                : 'bg-[#F6FAF9] text-[#6F7978] hover:text-[#191C1C] border border-[#D8DFDE]'
-                            }`}
-                          >
-                            {p}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
+                      {/* Grid Tabel Klasemen untuk Tiap Pool */}
+                      {poolsToRender.length === 0 ? (
+                        <div className="p-8 text-center bg-white rounded-2xl border border-[#D8DFDE] text-[#6F7978] text-xs">
+                          Belum ada data pool atau klasemen untuk turnamen ini.
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                          {poolsToRender.map((poolName) => {
+                            const teamsInPool = (effectiveGroupStandings?.standings || [])
+                              .filter((t) => t.pool === poolName)
+                              .sort((a, b) => (a.pos || 0) - (b.pos || 0));
 
-                    {/* Standings Table */}
-                    <div className="overflow-x-auto rounded-2xl border border-[#D8DFDE]">
-                      <table className="w-full text-left text-xs border-collapse">
-                        <thead>
-                          <tr className="bg-[#EEF4F3] border-b border-[#D8DFDE] text-[#6F7978] font-mono text-[11px] uppercase">
-                            <th className="py-3 px-3.5 text-center">Pos</th>
-                            <th className="py-3 px-4">Pasangan Pemain</th>
-                            <th className="py-3 px-3 text-center">Pool</th>
-                            <th className="py-3 px-3 text-center">Main</th>
-                            <th className="py-3 px-3 text-center">Menang</th>
-                            <th className="py-3 px-3 text-center">Kalah</th>
-                            <th className="py-3 px-3 text-center">Selisih Game</th>
-                            <th className="py-3 px-4 text-right">Poin</th>
-                            <th className="py-3 px-3 text-center">Kualifikasi</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-[#D8DFDE] bg-white">
-                          {activeTourney.groupStandings.standings
-                            .filter((t) => poolFilter === 'Semua Pool' || t.pool === poolFilter)
-                            .map((team, idx) => (
-                              <tr key={team.id} className="hover:bg-[#F6FAF9] transition-colors">
-                                <td className="py-3 px-3.5 text-center font-mono font-bold text-[#191C1C]">
-                                  <span
-                                    className={`inline-block w-6 h-6 text-center leading-6 rounded-md ${
-                                      team.isQualified
-                                        ? 'bg-[#006A6A] text-white'
-                                        : 'bg-[#EEF4F3] text-[#6F7978]'
-                                    }`}
-                                  >
-                                    {team.pos}
+                            return (
+                              <div
+                                key={poolName}
+                                className="rounded-2xl border border-[#D8DFDE] bg-white overflow-hidden shadow-2xs flex flex-col"
+                              >
+                                {/* Header Pool */}
+                                <div className="px-4 py-3 bg-[#EEF4F3]/80 border-b border-[#D8DFDE] flex items-center justify-between">
+                                  <div className="flex items-center gap-2">
+                                    <span className="w-2.5 h-2.5 rounded-full bg-[#006A6A]" />
+                                    <h5 className="font-bold text-sm text-[#191C1C] font-display">
+                                      {poolName}
+                                    </h5>
+                                  </div>
+                                  <span className="text-[10px] font-mono font-bold text-[#006A6A] bg-[#006A6A]/10 px-2.5 py-0.5 rounded-full border border-[#006A6A]/20">
+                                    Top 2 Lolos Playoff
                                   </span>
-                                </td>
-                                <td className="py-3 px-4">
-                                  <div className="font-bold text-[#191C1C] text-sm">{team.name}</div>
-                                  <div className="text-[11px] text-[#6F7978]">{team.p1} / {team.p2}</div>
-                                </td>
-                                <td className="py-3 px-3 text-center font-mono text-[#6F7978]">{team.pool}</td>
-                                <td className="py-3 px-3 text-center font-mono text-[#191C1C]">{team.played}</td>
-                                <td className="py-3 px-3 text-center font-mono text-[#191C1C] font-semibold">{team.won}</td>
-                                <td className="py-3 px-3 text-center font-mono text-[#6F7978]">{team.lost}</td>
-                                <td className="py-3 px-3 text-center font-mono text-[#006A6A] font-bold">
-                                  {team.gameDiff > 0 ? `+${team.gameDiff}` : team.gameDiff}
-                                </td>
-                                <td className="py-3 px-4 text-right font-mono font-black text-[#191C1C] text-sm">
-                                  {team.points}
-                                </td>
-                                <td className="py-3 px-3 text-center">
-                                  {team.isQualified ? (
-                                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
-                                      ✓ Lolos Playoff
-                                    </span>
-                                  ) : (
-                                    <span className="text-[10px] text-[#6F7978] font-mono">-</span>
-                                  )}
-                                </td>
-                              </tr>
-                            ))}
-                        </tbody>
-                      </table>
-                    </div>
+                                </div>
 
-                    <div className="text-xs text-[#6F7978] font-mono bg-[#F6FAF9] p-3 rounded-xl border border-[#D8DFDE] flex items-center justify-between flex-wrap gap-2">
-                      <span>Aturan Klasemen: Win = 2 Pts, Loss = 0 Pts · Tiebreaker: Head to Head lalu Selisih Game</span>
-                      <span className="text-[#006A6A] font-bold">Golden Point Active di Deuce (40-40)</span>
+                                {/* Minimalist Table */}
+                                <div className="overflow-x-auto flex-1">
+                                  <table className="w-full text-left text-xs border-collapse">
+                                    <thead>
+                                      <tr className="bg-[#F6FAF9] border-b border-[#D8DFDE] text-[#6F7978] font-mono text-[10px] uppercase">
+                                        <th className="py-2.5 px-3 text-center w-10">Pos</th>
+                                        <th className="py-2.5 px-3">Pasangan / Tim</th>
+                                        <th className="py-2.5 px-2 text-center w-9" title="Main">M</th>
+                                        <th className="py-2.5 px-2 text-center w-9" title="Menang">W</th>
+                                        <th className="py-2.5 px-2 text-center w-9" title="Kalah">L</th>
+                                        <th className="py-2.5 px-2.5 text-center w-11" title="Selisih Game">+/-</th>
+                                        <th className="py-2.5 px-3 text-right w-11" title="Poin">Pts</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-[#D8DFDE]">
+                                      {teamsInPool.length === 0 ? (
+                                        <tr>
+                                          <td colSpan={7} className="py-6 text-center text-xs text-[#6F7978]">
+                                            Belum ada tim di {poolName}
+                                          </td>
+                                        </tr>
+                                      ) : (
+                                        teamsInPool.map((team, idx) => {
+                                          const isQualified =
+                                            (team.played || 0) > 0 &&
+                                            Boolean(team.isQualified || (team.pos ? team.pos <= 2 : idx < 2));
+
+                                          return (
+                                            <tr key={team.id || idx} className="hover:bg-[#F6FAF9] transition-colors">
+                                              <td className="py-2.5 px-3 text-center font-mono font-bold">
+                                                <span
+                                                  className={`inline-flex items-center justify-center w-5 h-5 rounded-md text-[11px] ${
+                                                    isQualified
+                                                      ? 'bg-[#006A6A] text-white shadow-2xs font-bold'
+                                                      : 'bg-[#EEF4F3] text-[#6F7978]'
+                                                  }`}
+                                                >
+                                                  {team.pos || idx + 1}
+                                                </span>
+                                              </td>
+                                              <td className="py-2.5 px-3">
+                                                <div className="flex items-center gap-2">
+                                                  <img
+                                                    src={lookupPlayerPhoto(team.name || team.p1)}
+                                                    alt={team.name}
+                                                    className="w-6 h-6 rounded-full object-cover border border-[#D8DFDE] shadow-2xs shrink-0"
+                                                  />
+                                                  <div className="min-w-0">
+                                                    <div className="font-bold text-[#191C1C] text-xs truncate">
+                                                      {team.name}
+                                                    </div>
+                                                    <div className="text-[10px] text-[#6F7978] truncate">
+                                                      {team.p1} / {team.p2}
+                                                    </div>
+                                                  </div>
+                                                </div>
+                                              </td>
+                                              <td className="py-2.5 px-2 text-center font-mono text-[#191C1C]">{team.played}</td>
+                                              <td className="py-2.5 px-2 text-center font-mono font-semibold text-[#191C1C]">{team.won}</td>
+                                              <td className="py-2.5 px-2 text-center font-mono text-[#6F7978]">{team.lost}</td>
+                                              <td className="py-2.5 px-2.5 text-center font-mono font-bold text-[#006A6A]">
+                                                {team.gameDiff > 0 ? `+${team.gameDiff}` : team.gameDiff}
+                                              </td>
+                                              <td className="py-2.5 px-3 text-right font-mono font-black text-[#191C1C] text-xs">
+                                                {team.points}
+                                              </td>
+                                            </tr>
+                                          );
+                                        })
+                                      )}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      <div className="text-xs text-[#6F7978] font-mono bg-[#F6FAF9] p-3 rounded-xl border border-[#D8DFDE] flex items-center justify-between flex-wrap gap-2">
+                        <span>Aturan Klasemen: Win = 2 Pts, Loss = 0 Pts · Tiebreaker: Head to Head lalu Selisih Game</span>
+                        <span className="text-[#006A6A] font-bold">Golden Point Active di Deuce (40-40)</span>
+                      </div>
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
               </div>
 
               {/* Bottom Back Button */}
@@ -1402,34 +1905,87 @@ export const PadelProTournamentApp: React.FC = () => {
             </div>
 
             {/* Players Roster Cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {hallOfFamePlayers.map((p, idx) => (
-                <div
-                  key={idx}
-                  className="p-4 rounded-xl bg-white border border-[#D8DFDE] space-y-3 shadow-xs"
-                >
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <h4 className="text-sm font-bold text-[#191C1C]">{p.name}</h4>
-                      <p className="text-xs text-[#3D5A57]">Partner: {p.partner}</p>
-                    </div>
-                    <div className="flex items-center gap-1.5 font-mono text-xs">
-                      <span className="px-2 py-0.5 rounded-md bg-[#6E4D8B]/15 text-[#6E4D8B] border border-[#6E4D8B]/30 font-bold">
-                        🥇 {p.gold}
-                      </span>
-                      <span className="px-2 py-0.5 rounded-md bg-[#006A6A]/10 text-[#006A6A] border border-[#006A6A]/30 font-bold">
-                        🥈 {p.silver}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="text-[11px] text-[#6F7978] pt-2 border-t border-[#D8DFDE]">
-                    <span className="font-semibold text-[#191C1C]">Turnamen: </span>
-                    {p.tournaments.join(', ')}
-                  </div>
+            {hallOfFamePlayers.length === 0 ? (
+              <div className="p-8 text-center bg-white rounded-2xl border border-[#D8DFDE] space-y-2">
+                <div className="w-10 h-10 rounded-xl bg-[#006A6A]/10 text-[#006A6A] flex items-center justify-center mx-auto">
+                  <Users className="w-5 h-5" />
                 </div>
-              ))}
-            </div>
+                <div className="text-xs font-bold text-[#191C1C]">
+                  {liveClubMembers.length === 0 ? 'Belum Ada Pemain di Hall of Fame' : 'Pemain Tidak Ditemukan'}
+                </div>
+                <p className="text-[11px] text-[#6F7978] max-w-sm mx-auto">
+                  {liveClubMembers.length === 0
+                    ? 'Seluruh daftar pemain dan catatan prestasi telah dikosongkan melalui Reset Default.'
+                    : 'Tidak ada pemain berprestasi yang cocok dengan kata kunci pencarian.'}
+                </p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                {hallOfFamePlayers.map((p, idx) => (
+                  <div
+                    key={idx}
+                    className="p-4 rounded-2xl bg-white border border-[#D8DFDE] space-y-3 shadow-xs hover:shadow-md transition-all flex flex-col justify-between"
+                  >
+                    <div className="flex items-start gap-3.5">
+                      {/* Player Photo Uploaded by Admin */}
+                      <img
+                        src={p.photoUrl || lookupPlayerPhoto(p.name)}
+                        alt={p.name}
+                        className="w-14 h-14 rounded-2xl object-cover border-2 border-white shadow-sm ring-1 ring-[#D8DFDE] shrink-0"
+                      />
+
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="font-mono text-[10px] font-bold text-[#006A6A] bg-[#006A6A]/10 px-2 py-0.5 rounded-md">
+                            {p.id}
+                          </span>
+                          {p.isGroupQualified && (
+                            <span className="text-[9px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 px-1.5 py-0.5 rounded-md">
+                              ✓ Lolos Fase Grup
+                            </span>
+                          )}
+                        </div>
+                        <h4 className="text-sm font-bold text-[#191C1C] truncate mt-1">
+                          {p.name}
+                        </h4>
+                        <p className="text-xs text-[#3D5A57] truncate">
+                          Partner: {p.achievements?.partnerDefault || '-'}
+                        </p>
+                      </div>
+
+                      {/* Medals */}
+                      <div className="flex items-center gap-1 font-mono text-xs shrink-0">
+                        {(p.achievements?.gold || 0) > 0 && (
+                          <span className="px-2 py-0.5 rounded-md bg-[#6E4D8B]/15 text-[#6E4D8B] border border-[#6E4D8B]/30 font-bold" title="Juara 1 Emas">
+                            🥇 {p.achievements.gold}
+                          </span>
+                        )}
+                        {(p.achievements?.silver || 0) > 0 && (
+                          <span className="px-2 py-0.5 rounded-md bg-[#006A6A]/10 text-[#006A6A] border border-[#006A6A]/30 font-bold" title="Juara 2 Perak">
+                            🥈 {p.achievements.silver}
+                          </span>
+                        )}
+                        {(p.achievements?.bronze || 0) > 0 && (
+                          <span className="px-2 py-0.5 rounded-md bg-orange-100 text-orange-800 border border-orange-300 font-bold" title="Juara 3 Perunggu">
+                            🥉 {p.achievements.bronze}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="text-[11px] text-[#6F7978] pt-2 border-t border-[#D8DFDE] flex items-center justify-between">
+                      <span className="truncate flex items-center gap-1">
+                        <MapPin className="w-3 h-3 text-[#006A6A]" />
+                        <span>{p.city || 'Solo'}</span>
+                      </span>
+                      <span className="text-[10px] text-[#006A6A] font-semibold shrink-0 font-mono">
+                        {p.achievements?.tournaments?.length || 1} Turnamen
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Section: Cari Turnamen */}
@@ -1444,30 +2000,91 @@ export const PadelProTournamentApp: React.FC = () => {
               </p>
             </div>
 
-            <div className="p-5 rounded-2xl bg-white border border-[#D8DFDE] space-y-4 shadow-xs">
-              <div className="font-bold text-[#191C1C] text-sm">
-                F3 Rookie Men vol 2 (Padeloka)
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
-                <div className="p-3 rounded-xl bg-[#6E4D8B]/10 border border-[#6E4D8B]/30 space-y-1">
-                  <span className="text-[#6E4D8B] font-bold block">🥇 JUARA 1 (GOLD)</span>
-                  <span className="font-bold text-[#191C1C] block">KARTIKA / DODIE ADAM</span>
-                  <span className="text-[11px] text-[#3D5A57]">Piala & Voucher Rp 10 Juta</span>
-                </div>
-
-                <div className="p-3 rounded-xl bg-[#006A6A]/10 border border-[#006A6A]/30 space-y-1">
-                  <span className="text-[#006A6A] font-bold block">🥈 JUARA 2 (SILVER)</span>
-                  <span className="font-bold text-[#191C1C] block">EVAN / NGOE</span>
-                  <span className="text-[11px] text-[#3D5A57]">Piala & Voucher Rp 5 Juta</span>
-                </div>
-
-                <div className="p-3 rounded-xl bg-[#F6FAF9] border border-[#D8DFDE] space-y-1">
-                  <span className="text-[#3D5A57] font-bold block">🥉 JUARA 3 (BRONZE)</span>
-                  <span className="font-bold text-[#191C1C] block">BIMO / FARHAN</span>
-                  <span className="text-[11px] text-[#6F7978]">Medali Perunggu</span>
-                </div>
-              </div>
+            <div className="relative max-w-md">
+              <Search className="w-4 h-4 text-[#6F7978] absolute left-3.5 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="Ketik nama turnamen (misal: Rookie, HDMC, F3)..."
+                value={tournamentSearchQuery}
+                onChange={(e) => setTournamentSearchQuery(e.target.value)}
+                className="w-full pl-10 pr-4 py-2.5 rounded-xl bg-white border border-[#D8DFDE] text-xs text-[#191C1C] placeholder-[#6F7978] focus:outline-none focus:border-[#006A6A]"
+              />
             </div>
+
+            {finishedTournaments.length === 0 ? (
+              <div className="p-8 text-center bg-white rounded-2xl border border-[#D8DFDE] space-y-2">
+                <div className="w-10 h-10 rounded-xl bg-[#6E4D8B]/10 text-[#6E4D8B] flex items-center justify-center mx-auto">
+                  <Trophy className="w-5 h-5" />
+                </div>
+                <div className="text-xs font-bold text-[#191C1C]">
+                  {storedTournaments.length === 0 ? 'Belum Ada Rekap Turnamen Selesai' : 'Turnamen Tidak Ditemukan'}
+                </div>
+                <p className="text-[11px] text-[#6F7978] max-w-sm mx-auto">
+                  {storedTournaments.length === 0
+                    ? 'Seluruh rekapitulasi podium juara dan turnamen telah dikosongkan melalui Reset Default.'
+                    : 'Tidak ada rekap turnamen yang cocok dengan kata kunci pencarian.'}
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {finishedTournaments.map((t) => {
+                  const podium = t.winners?.podium || [];
+                  const gold = podium.find((p) => p.place === '1');
+                  const silver = podium.find((p) => p.place === '2');
+                  const bronze = podium.find((p) => p.place === '3');
+
+                  return (
+                    <div key={t.id} className="p-5 rounded-2xl bg-white border border-[#D8DFDE] space-y-4 shadow-xs">
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <div>
+                          <div className="font-bold text-[#191C1C] text-sm">
+                            {t.name}
+                          </div>
+                          <div className="text-[11px] text-[#6F7978]">
+                            {t.organizer} · {t.location} · {t.date}
+                          </div>
+                        </div>
+                        <span className="px-2.5 py-0.5 rounded-md text-[10px] font-bold bg-[#006A6A]/10 text-[#006A6A] border border-[#006A6A]/30">
+                          ✓ REKAP PODIUM
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                        <div className="p-3 rounded-xl bg-[#6E4D8B]/10 border border-[#6E4D8B]/30 space-y-1">
+                          <span className="text-[#6E4D8B] font-bold block">🥇 JUARA 1 (GOLD)</span>
+                          <span className="font-bold text-[#191C1C] block uppercase truncate">
+                            {gold ? gold.teamName || `${gold.p1} / ${gold.p2}` : 'TBD'}
+                          </span>
+                          <span className="text-[11px] text-[#3D5A57] block truncate">
+                            {gold?.prize || 'Piala & Hadiah'}
+                          </span>
+                        </div>
+
+                        <div className="p-3 rounded-xl bg-[#006A6A]/10 border border-[#006A6A]/30 space-y-1">
+                          <span className="text-[#006A6A] font-bold block">🥈 JUARA 2 (SILVER)</span>
+                          <span className="font-bold text-[#191C1C] block uppercase truncate">
+                            {silver ? silver.teamName || `${silver.p1} / ${silver.p2}` : 'TBD'}
+                          </span>
+                          <span className="text-[11px] text-[#3D5A57] block truncate">
+                            {silver?.prize || 'Piala & Hadiah'}
+                          </span>
+                        </div>
+
+                        <div className="p-3 rounded-xl bg-[#F6FAF9] border border-[#D8DFDE] space-y-1">
+                          <span className="text-[#3D5A57] font-bold block">🥉 JUARA 3 (BRONZE)</span>
+                          <span className="font-bold text-[#191C1C] block uppercase truncate">
+                            {bronze ? bronze.teamName || `${bronze.p1} / ${bronze.p2}` : 'TBD'}
+                          </span>
+                          <span className="text-[11px] text-[#6F7978] block truncate">
+                            {bronze?.prize || 'Medali Perunggu'}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       )}
