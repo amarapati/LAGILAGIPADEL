@@ -5,6 +5,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import {
   initDatabase,
+  getDb,
   getAllTournaments,
   getTournamentById,
   saveOrUpdateTournament,
@@ -37,6 +38,7 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
 
   // JSON middleware with generous limit for images & bracket trees
+  app.set('etag', false);
   app.use(express.json({ limit: '20mb' }));
   app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
@@ -54,10 +56,20 @@ async function startServer() {
   app.use('/uploads', express.static(path.resolve(__dirname, 'public/uploads')));
   app.use('/uploads', express.static(path.resolve(__dirname, 'uploads')));
 
-  // Initialize SQLite database
+  // Initialize server database
   await initDatabase();
 
   // ------------------- REST API ENDPOINTS ------------------- //
+
+  // Strict anti-caching middleware for all /api endpoints to guarantee real-time cross-device sync
+  app.use('/api', (req: Request, res: Response, next) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+    res.removeHeader('ETag');
+    next();
+  });
 
   // Tournament Banner Upload Endpoint (Saves to uploads/banner/ with random MD5 varchar filename)
   app.post('/api/upload/banner', async (req: Request, res: Response) => {
@@ -130,7 +142,14 @@ async function startServer() {
 
   // Health and System Sync Summary
   app.get('/api/health', (req: Request, res: Response) => {
-    res.json({ status: 'ok', service: 'LagiLagiPadel SQLite API', timestamp: new Date().toISOString() });
+    const db = getDb();
+    res.json({
+      status: 'ok',
+      service: 'LagiLagiPadel Server Database API',
+      database_type: db.type,
+      database_name: db.type === 'mysql' ? (process.env.DB_NAME || 'u372224362_llp') : 'padel_database.sqlite',
+      timestamp: new Date().toISOString()
+    });
   });
 
   app.get('/api/sync/summary', async (req: Request, res: Response) => {
@@ -440,7 +459,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[LagiLagiPadel Server] Running with SQLite database on http://0.0.0.0:${PORT}`);
+    console.log(`[LagiLagiPadel Server] Running with MySQL database on http://0.0.0.0:${PORT}`);
   });
 }
 
